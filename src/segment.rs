@@ -106,6 +106,9 @@ pub struct Segment {
     map: MmapRaw,
     /// The committed end: every record below it is complete.
     end: AtomicU32,
+    /// Committed records not yet consumed: LIVE or LEASED. Once a sealed
+    /// segment's count is zero it holds only garbage and can be dropped.
+    pending: AtomicU32,
 }
 
 impl Segment {
@@ -142,6 +145,7 @@ impl Segment {
             file,
             map,
             end: AtomicU32::new(0),
+            pending: AtomicU32::new(0),
         })
     }
 
@@ -165,7 +169,7 @@ impl Segment {
         let size = size as u32;
 
         let map = MmapRaw::map_raw(&file)?;
-        let end = recover(&map);
+        let (end, pending) = recover(&map);
         if (end as u64) < size as u64 {
             // Zero the rest. A record past the end can be intact on disk
             // while one before it was torn (pages reach disk in any order),
@@ -184,6 +188,7 @@ impl Segment {
             file,
             map,
             end: AtomicU32::new(end),
+            pending: AtomicU32::new(pending),
         })
     }
 
@@ -208,6 +213,20 @@ impl Segment {
     /// Bytes left after the committed end.
     pub fn remaining(&self) -> u32 {
         self.size() - self.end()
+    }
+
+    /// Committed records still LIVE or LEASED.
+    pub fn pending(&self) -> u32 {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    /// Counts one record out of [`pending`](Self::pending), after the
+    /// caller moved it from LIVE or LEASED to ACKED or DEAD. Returns whether
+    /// that was the last one.
+    pub(crate) fn release(&self) -> bool {
+        let was = self.pending.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(was > 0, "released more records than were pending");
+        was == 1
     }
 
     /// The record at `off`, if a committed record starts there. `off` must
@@ -275,6 +294,8 @@ impl Segment {
             std::ptr::copy_nonoverlapping(json.as_ptr(), body.add(index.len()), json.len());
             AtomicU8::from_ptr(base.add(OFF_STATE)).store(State::Live as u8, Ordering::Release);
         }
+        // Counted before it is visible, so a consumer can't release it first.
+        self.pending.fetch_add(1, Ordering::AcqRel);
         self.end
             .store(off + stride(total_len) as u32, Ordering::Release);
         Some(Seq::new(self.id, off))
@@ -332,6 +353,9 @@ impl<'a> RecordRef<'a> {
 
     /// Moves the record from `from` to `to` if it is still in `from`.
     /// Returns whether it moved; exactly one of any racing callers wins.
+    ///
+    /// This does not keep the segment's pending count: moves to ACKED or
+    /// DEAD go through [`Log::retire`](crate::Log::retire).
     pub fn cas_state(&self, from: State, to: State) -> bool {
         self.state
             .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
@@ -386,13 +410,15 @@ fn record_crc(header: &[u8; RECORD_HEADER_LEN], index: &[u8], json: &[u8]) -> u3
     crc32c::crc32c_append(crc, json)
 }
 
-/// Walks the records from the start and returns where the good ones end.
-/// Runs before anyone else can see the segment.
-fn recover(map: &MmapRaw) -> u32 {
+/// Walks the records from the start and returns where the good ones end,
+/// and how many of them are still LIVE. Runs before anyone else can see the
+/// segment.
+fn recover(map: &MmapRaw) -> (u32, u32) {
     // SAFETY: the segment is not shared yet, so nothing else reads or
     // writes the map while we hold this slice.
     let buf = unsafe { std::slice::from_raw_parts_mut(map.as_mut_ptr(), map.len()) };
     let mut off = 0usize;
+    let mut pending = 0;
     while off + RECORD_HEADER_LEN <= buf.len() {
         let rec = &buf[off..];
         let total_len = read_le_u32(rec) as usize;
@@ -402,9 +428,12 @@ fn recover(map: &MmapRaw) -> u32 {
         if rec[OFF_STATE] == State::Leased as u8 {
             buf[off + OFF_STATE] = State::Live as u8;
         }
+        if buf[off + OFF_STATE] == State::Live as u8 {
+            pending += 1;
+        }
         off += stride(total_len);
     }
-    off.min(buf.len()) as u32
+    (off.min(buf.len()) as u32, pending)
 }
 
 /// Whether the record at the start of `rec` is whole and intact.

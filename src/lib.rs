@@ -8,8 +8,10 @@
 mod builder;
 mod error;
 mod json;
+mod lease;
 mod log;
 mod note;
+mod queue;
 mod segment;
 mod verify;
 
@@ -17,5 +19,6 @@ pub use builder::{NoteBuilder, build_note};
 pub use error::Error;
 pub use log::{Config, Fsync, Log, Record, Scan};
 pub use note::{HEAD_LEN, NoteRef, Span, Tag, TagValues, Tags};
+pub use queue::{Lease, Noq};
 pub use segment::{RECORD_HEADER_LEN, RECORD_VERSION, RecordRef, Records, Segment, Seq, State};
 pub use verify::{canonical, compute_id, verify_sig};

@@ -6,6 +6,11 @@
 //! sealed segment is on disk before a record lands past it. A crash can
 //! only tear records in the tail, and opening the log recovers each segment
 //! by truncating at its first bad record.
+//!
+//! Each segment counts its pending (LIVE or LEASED) records. When a sealed
+//! segment's count reaches zero, through [`Log::retire`], it holds only
+//! garbage: it leaves the log and its file is unlinked. The tail is never
+//! dropped, drained or not, until a rotation seals it.
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -96,6 +101,11 @@ impl Log {
             segments.push(Arc::new(Segment::create(&dir, 0, config.segment_size)?));
             sync_dir(&dir)?;
         }
+        // Drained segments left by the last process, or whose unlink failed.
+        let tail_id = segments.last().unwrap().id();
+        for seg in segments.extract_if(.., |s| s.id() != tail_id && s.pending() == 0) {
+            fs::remove_file(seg.path())?;
+        }
 
         let tail = segments.last().unwrap().clone();
         Ok(Log {
@@ -171,10 +181,59 @@ impl Log {
         )?);
         sync_dir(&self.dir)?;
         self.segments.write().push(next.clone());
-        w.tail = next;
+        let sealed = std::mem::replace(&mut w.tail, next);
         w.synced = 0;
         w.synced_at = Instant::now();
+        // Drained while it was the tail, so nothing reclaimed it then.
+        if sealed.pending() == 0 {
+            self.reclaim(&sealed);
+        }
         Ok(())
+    }
+
+    /// Moves a pending record (`from` LIVE or LEASED) to a garbage state
+    /// (`to` ACKED or DEAD), if it is still in `from`. Returns whether it
+    /// moved. The record's segment is dropped if this was its last pending
+    /// record and it is not the tail.
+    ///
+    /// Every such move must go through here, not [`RecordRef::cas_state`],
+    /// or the segment's pending count never reaches zero. A LEASED record
+    /// belongs to the [`Lease`](crate::Lease) holding it; retire it only
+    /// through that.
+    pub fn retire(&self, rec: &Record, from: State, to: State) -> bool {
+        debug_assert!(matches!(from, State::Live | State::Leased));
+        debug_assert!(matches!(to, State::Acked | State::Dead));
+        if !rec.get().cas_state(from, to) {
+            return false;
+        }
+        if rec.seg.release() {
+            self.reclaim(&rec.seg);
+        }
+        true
+    }
+
+    /// Drops `seg` from the log and unlinks its file, if it is drained and
+    /// not the tail. Records still held keep its memory mapped; the unlinked
+    /// file's space comes back once the last is dropped.
+    ///
+    /// An unlink that fails leaves the file behind, and the next open drops
+    /// it, so this never fails the caller.
+    fn reclaim(&self, seg: &Arc<Segment>) {
+        {
+            let mut segs = self.segments.write();
+            // The writer pushes the next tail under this lock before it
+            // checks the old one, so a segment seen as the tail here is
+            // reclaimed by the rotation instead.
+            if segs.last().is_some_and(|t| Arc::ptr_eq(t, seg)) || seg.pending() != 0 {
+                return;
+            }
+            let Some(i) = segs.iter().position(|s| Arc::ptr_eq(s, seg)) else {
+                // Already reclaimed by a racing caller.
+                return;
+            };
+            segs.remove(i);
+        }
+        let _ = fs::remove_file(seg.path());
     }
 
     fn write_back(&self, w: &mut Writer) -> Result<(), Error> {
@@ -194,6 +253,11 @@ impl Log {
     /// A snapshot of the segments, oldest first.
     pub fn segments(&self) -> Vec<Arc<Segment>> {
         self.segments.read().clone()
+    }
+
+    /// The seq of the oldest segment's start. Every seq before it is gone.
+    pub fn head_seq(&self) -> Seq {
+        Seq::new(self.segments.read()[0].id(), 0)
     }
 
     /// The seq the next append in the tail would get.

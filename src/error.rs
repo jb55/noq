@@ -31,6 +31,9 @@ pub enum Error {
     Config(&'static str),
     /// A segment file that can't be opened as one.
     Corrupt(&'static str),
+    /// The lease ran out (or was already ended) before it was acked, nacked
+    /// or extended; the item went back to the queue.
+    LeaseExpired,
 }
 
 impl PartialEq for Error {
@@ -72,6 +75,7 @@ impl fmt::Display for Error {
             Error::Locked => write!(f, "the log is open in another process"),
             Error::Config(what) => write!(f, "bad config: {what}"),
             Error::Corrupt(what) => write!(f, "corrupt segment: {what}"),
+            Error::LeaseExpired => write!(f, "the lease expired"),
         }
     }
 }
