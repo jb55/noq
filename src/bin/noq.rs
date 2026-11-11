@@ -26,6 +26,8 @@ commands:
                        line; they are queued again when noq exits unless
                        --ack consumes them
   ack ID...            consume the queued events with these ids
+  compact              move queued events off mostly-consumed segments so
+                       those can be dropped; prints how many moved
   stats                print the queue's size
 
 FILTER is one NIP-01 filter object, e.g. '{\"kinds\":[1]}'; the default,
@@ -108,6 +110,11 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
                 .map(|a| parse_id(&a).ok_or(format!("bad id: {a}")))
                 .collect::<Result<Vec<_>, _>>()?;
             ack(&open()?, &ids)
+        }
+        "compact" => {
+            args.done()?;
+            println!("moved {}", open()?.compact());
+            Ok(ExitCode::SUCCESS)
         }
         "stats" => {
             args.done()?;
@@ -308,6 +315,7 @@ fn stats(q: &Noq) -> Result<ExitCode, String> {
     let log = q.log();
     let segments = log.segments();
     let pending: u64 = segments.iter().map(|s| s.pending() as u64).sum();
+    let records: u64 = segments.iter().map(|s| s.count() as u64).sum();
     let used: u64 = segments.iter().map(|s| s.end() as u64).sum();
     let disk: u64 = segments.iter().map(|s| s.size() as u64).sum();
     let ix = q.index_stats();
@@ -315,6 +323,7 @@ fn stats(q: &Noq) -> Result<ExitCode, String> {
     println!("segments  {}", segments.len());
     println!("head      {}", seq(log.head_seq()));
     println!("tail      {}", seq(log.tail_seq()));
+    println!("records   {records}");
     println!("pending   {pending}");
     println!("leased    {}", q.leased());
     println!("used      {used}");

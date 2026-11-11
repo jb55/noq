@@ -134,3 +134,41 @@ fn bad_arguments_exit_2() {
     }
     assert!(noq(dir.path(), &["--help"], b"").status.success());
 }
+
+#[test]
+fn compact_moves_what_is_left_on_consumed_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Signer::new(1);
+    let evs: Vec<Vec<u8>> = (0..60)
+        .map(|i| s.event(i, if i % 5 == 0 { 2 } else { 1 }, &[], ""))
+        .collect();
+    let o = noq(
+        dir.path(),
+        &["--segment-size", "4k", "push"],
+        &evs.join(&b'\n'),
+    );
+    assert!(o.status.success());
+    assert!(stat(dir.path(), "segments") > 3);
+    let o = noq(dir.path(), &["lease", r#"{"kinds":[1]}"#, "--ack"], b"");
+    assert_eq!(lines(&o).len(), 48);
+
+    let o = noq(dir.path(), &["compact"], b"");
+    assert!(o.status.success());
+    let moved: u64 = lines(&o)[0]
+        .strip_prefix("moved ")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(moved > 0, "{:?}", lines(&o));
+    assert_eq!(lines(&noq(dir.path(), &["compact"], b"")), ["moved 0"]);
+    assert_eq!(stat(dir.path(), "pending"), 12);
+    let mut got = lines(&noq(dir.path(), &["peek", r#"{"kinds":[2]}"#], b""));
+    let mut want: Vec<String> = evs
+        .iter()
+        .step_by(5)
+        .map(|e| String::from_utf8(e.clone()).unwrap())
+        .collect();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want);
+}

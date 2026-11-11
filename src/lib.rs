@@ -17,6 +17,7 @@ mod note;
 mod notify;
 mod queue;
 mod segment;
+mod sidecar;
 mod verify;
 
 pub use builder::{NoteBuilder, build_note};

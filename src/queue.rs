@@ -25,6 +25,14 @@
 //! Every id stays known while its record is in the log, and a bounded seen
 //! ring remembers it after, so pushing a consumed event again is a no-op.
 //!
+//! A sealed segment whose records are mostly consumed is compacted: its
+//! queued items are copied to the tail and the originals die, so the
+//! segment drains and drops instead of being pinned by a few items. Every
+//! seal compacts the segments older than the one it sealed, and
+//! [`compact`](Noq::compact) does all of them now. A moved item is queued
+//! after the items pushed before the move: compaction trades its place in
+//! line for the space.
+//!
 //! [`wait_lease`](Noq::wait_lease) blocks until a lease gets something. It
 //! sleeps on a [`Signal`] that a push which queues an item, a nack and a
 //! lease running out each bump, and tries again on every bump. While it
@@ -49,12 +57,17 @@ use crate::lease::Leases;
 use crate::log::{Config, Log, Record};
 use crate::note::{KindClass, NoteRef};
 use crate::notify::Signal;
-use crate::segment::{Seq, State};
+use crate::segment::{Segment, Seq, State};
+use crate::sidecar::Sidecar;
 
 /// Candidates read from the index per lock: a walk holds the index's read
 /// lock only while it copies one batch, so pushes wait on that, not on the
 /// whole lease.
 const BATCH: usize = 256;
+
+/// A sealed segment is compacted once fewer than one in this many of its
+/// records are pending.
+const COMPACT_BELOW: u64 = 4;
 
 thread_local! {
     /// Parse scratch for [`Noq::push`], so verification runs outside every
@@ -119,6 +132,8 @@ struct Inner {
     push_lock: Mutex<()>,
     /// [`Log::dropped`] when the index was last trimmed.
     trimmed: AtomicU64,
+    /// [`Log::sealed`] when segments were last compacted.
+    compacted: AtomicU64,
     expiry: Expiry,
     /// Bumped when an item may have become leasable.
     queued: Arc<Signal>,
@@ -140,25 +155,54 @@ impl Noq {
     /// leased when the last process exited are queued again; expired ones
     /// and replaced versions die.
     pub fn open(dir: impl AsRef<Path>, config: Config) -> Result<Noq, Error> {
-        let log = Log::open(dir, config)?;
+        let log = Log::open_indexed(dir, config)?;
         let trimmed = AtomicU64::new(log.dropped());
+        let compacted = AtomicU64::new(log.sealed());
         let mut index = Index::new(config.seen_ids);
         let expiry = Expiry::new(config.max_age);
-        for rec in log.scan(Seq(0)) {
-            let r = rec.get();
-            let note = r.note();
-            // Recovery made every pending record LIVE.
-            let pending = r.state() == State::Live;
-            // A replaced version still LIVE: its replacement's push died
-            // before killing it, or it was leased then and came back.
-            if let Some(old) = index
-                .insert(&note, rec.seq(), pending)
-                .and_then(|s| log.get(s))
-            {
+        // A record that lost to a later one and is still LIVE: a replaced
+        // version whose replacement's push died before killing it, or that
+        // was leased then and came back; or a copy compaction made of
+        // itself before it died.
+        let kill = |lost: Option<Seq>| {
+            if let Some(old) = lost.and_then(|s| log.get(s)) {
                 log.retire(&old, State::Live, State::Dead);
             }
-            if let (true, Some(at)) = (pending, expiry.of(&note)) {
-                expiry.add(at, rec.seq());
+        };
+        for seg in log.segments() {
+            if let Some(sc) = log.take_sidecar(seg.id()) {
+                // Recovery made every pending record LIVE.
+                let pending: Vec<bool> = sc
+                    .records
+                    .iter()
+                    .map(|e| seg.record(e.off).is_some_and(|r| r.state() == State::Live))
+                    .collect();
+                for (e, &pending) in sc.records.iter().zip(&pending) {
+                    let seq = Seq::new(seg.id(), e.off);
+                    kill(index.id_at(&e.id, seq));
+                    if e.replaces {
+                        let r = seg.record(e.off).expect("a listed record is committed");
+                        kill(index.place(&r.note(), seq));
+                    }
+                    if let (true, Some(at)) = (pending, expiry.at(e.created_at, e.expiration)) {
+                        expiry.add(at, seq);
+                    }
+                }
+                for (key, ords) in &sc.keys {
+                    let key = Sidecar::key(key).expect("a decoded sidecar's keys parse");
+                    for &o in ords.iter().filter(|&&o| pending[o as usize]) {
+                        index.post_key(key, sc.seq(o));
+                    }
+                }
+                continue;
+            }
+            for r in seg.records(0) {
+                let note = r.note();
+                let pending = r.state() == State::Live;
+                kill(index.insert(&note, r.seq(), pending));
+                if let (true, Some(at)) = (pending, expiry.of(&note)) {
+                    expiry.add(at, r.seq());
+                }
             }
         }
         let queued = Arc::new(Signal::default());
@@ -169,6 +213,7 @@ impl Noq {
             index: RwLock::new(index),
             push_lock: Mutex::new(()),
             trimmed,
+            compacted,
             expiry,
             queued,
             leases,
@@ -239,6 +284,12 @@ impl Noq {
         // The append may have sealed a drained tail and dropped it, and the
         // kills may have drained others.
         self.trim();
+        let sealed = inner.log.sealed();
+        if inner.compacted.swap(sealed, Ordering::AcqRel) != sealed {
+            // The newest sealed segment is left a segment's worth of
+            // pushes for its consumers to catch up.
+            self.compact_older(2);
+        }
         Ok(pushed)
     }
 
@@ -346,6 +397,10 @@ impl Noq {
             self.0.expiry.sweep(&self.0.log, now);
         }
         self.walk_at(filter, now, visit);
+        let inner = &self.0;
+        if inner.index.read().wasteful() {
+            inner.index.write().compact(&inner.log);
+        }
         self.trim();
     }
 
@@ -442,6 +497,77 @@ impl Noq {
             self.trim();
         }
         self.hold(taken, ttl)
+    }
+
+    /// Compacts every sealed segment that is mostly consumed: copies its
+    /// queued items to the tail and kills the originals, so the segment
+    /// drops. Leased items stay where they are until they are acked, or
+    /// nacked and compacted later. Returns how many items moved.
+    pub fn compact(&self) -> usize {
+        self.compact_older(1)
+    }
+
+    /// Compacts the holey segments older than the newest `keep`.
+    fn compact_older(&self, keep: usize) -> usize {
+        let segs = self.0.log.segments();
+        let old = &segs[..segs.len().saturating_sub(keep)];
+        let moved = old
+            .iter()
+            .filter(|s| {
+                let pending = s.pending() as u64;
+                pending > 0 && pending * COMPACT_BELOW < s.count() as u64
+            })
+            .map(|s| self.compact_segment(s))
+            .sum();
+        self.trim();
+        if moved > 0 {
+            // A walk that ran while an item was between its two copies
+            // missed it.
+            self.0.queued.bump();
+        }
+        moved
+    }
+
+    /// Moves each LIVE item of `seg` to the tail. Returns how many moved.
+    fn compact_segment(&self, seg: &Segment) -> usize {
+        let inner = &self.0;
+        let now = expire::now();
+        let mut moved = 0;
+        let _push = inner.push_lock.lock();
+        for r in seg.records(0) {
+            if r.state() != State::Live {
+                continue;
+            }
+            let Some(rec) = inner.log.get(r.seq()) else {
+                return moved;
+            };
+            // Not worth a copy.
+            if self.kill_if_dead(&rec, now) {
+                continue;
+            }
+            // Held, so no walk takes it while it is in two places. A crash
+            // from here until it dies leaves both copies LIVE, and reopening
+            // kills this one: the index sees the event's id again.
+            if !r.cas_state(State::Live, State::Leased) {
+                continue;
+            }
+            let note = r.note();
+            let seq = match inner.log.append_note(note) {
+                Ok(seq) => seq,
+                Err(_) => {
+                    r.cas_state(State::Leased, State::Live);
+                    return moved;
+                }
+            };
+            let copied = inner.index.write().insert(&note, seq, true);
+            debug_assert_eq!(copied, Some(r.seq()), "the copy displaces the original");
+            if let Some(at) = inner.expiry.of(&note) {
+                inner.expiry.add(at, seq);
+            }
+            inner.log.retire(&rec, State::Leased, State::Dead);
+            moved += 1;
+        }
+        moved
     }
 
     /// Cuts the index back to the log's segments, if one was dropped since

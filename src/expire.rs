@@ -47,8 +47,14 @@ impl Expiry {
 
     /// When `note` expires, if it does.
     pub(crate) fn of(&self, note: &NoteRef<'_>) -> Option<u64> {
-        let aged = self.max_age.map(|a| note.created_at().saturating_add(a));
-        match (note.expiration(), aged) {
+        self.at(note.created_at(), note.expiration())
+    }
+
+    /// When an event created at `created_at`, with this NIP-40
+    /// `expiration` tag, expires, if it does.
+    pub(crate) fn at(&self, created_at: u64, expiration: Option<u64>) -> Option<u64> {
+        let aged = self.max_age.map(|a| created_at.saturating_add(a));
+        match (expiration, aged) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }

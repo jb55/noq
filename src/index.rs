@@ -15,14 +15,16 @@
 //! A posting list is never edited when a record is acked or killed. Walks
 //! skip such records by their state byte, and each list keeps a cursor past
 //! its prefix of consumed records, so a long-drained head is skipped once
-//! rather than on every lease. When the log drops a segment, wherever it
-//! is, [`Index::trim`] cuts every list (and `ids`) back to what is left,
-//! and moves the forgotten ids to `seen`.
+//! rather than on every lease. Consumed records past the cursor, behind one
+//! that is held, are skipped each time; once a list has skipped as many as
+//! it holds, [`Index::compact`] drops them. When the log drops a segment,
+//! wherever it is, [`Index::trim`] cuts every list (and `ids`) back to what
+//! is left, and moves the forgotten ids to `seen`.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::filter::Filter;
 use crate::log::Log;
@@ -46,6 +48,34 @@ pub enum Plan {
     Scan,
 }
 
+/// Consumed entries a posting list may skip past its cursor before it is
+/// worth compacting, however short it is.
+const WASTE: usize = 64;
+
+/// What a posting list is keyed by: one of the clauses a filter can be
+/// planned on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Key<'a> {
+    Author(&'a [u8; 32]),
+    Kind(u32),
+    /// A single-letter tag's letter and first value.
+    Tag(u8, &'a [u8]),
+}
+
+/// Calls `f` with every key `note` is posted under.
+pub(crate) fn keys<'a>(note: &NoteRef<'a>, mut f: impl FnMut(Key<'a>)) {
+    f(Key::Author(note.pubkey()));
+    f(Key::Kind(note.kind()));
+    for tag in note.tags() {
+        let (Some(&[letter]), Some(value)) = (tag.get(0), tag.get(1)) else {
+            continue;
+        };
+        if letter.is_ascii_alphabetic() {
+            f(Key::Tag(letter, value));
+        }
+    }
+}
+
 #[derive(Default)]
 struct Posting {
     /// Seqs in ascending order, each once.
@@ -54,6 +84,9 @@ struct Posting {
     /// states are final, so the cursor only moves forward; any reader
     /// advances it.
     skip: AtomicUsize,
+    /// Consumed entries past `skip` that walks have stepped over since the
+    /// list was last compacted.
+    waste: AtomicUsize,
 }
 
 impl Posting {
@@ -85,16 +118,46 @@ impl Posting {
         i
     }
 
-    /// Appends up to `n` of this list's seqs in `range` to `out`.
-    fn collect(&self, log: &Log, range: &Range<Seq>, n: usize, out: &mut Vec<Seq>) {
+    /// Appends up to `n` of this list's seqs in `range` that are not
+    /// consumed to `out`. Returns whether the list now wants
+    /// [`compact`](Self::compact)ing.
+    fn collect(&self, log: &Log, range: &Range<Seq>, n: usize, out: &mut Vec<Seq>) -> bool {
         let skip = self.advance(log);
         let from = skip.max(self.seqs.partition_point(|&s| s < range.start));
-        out.extend(
-            self.seqs[from..]
-                .iter()
-                .take(n)
-                .take_while(|&&s| s < range.end),
-        );
+        let mut wasted = 0;
+        let mut taken = 0;
+        for &seq in &self.seqs[from..] {
+            if taken == n || seq >= range.end {
+                break;
+            }
+            if consumed(log, seq) {
+                wasted += 1;
+            } else {
+                out.push(seq);
+                taken += 1;
+            }
+        }
+        wasted > 0 && self.waste.fetch_add(wasted, Ordering::Relaxed) + wasted >= self.budget()
+    }
+
+    /// How much [`waste`](Self::waste) the list takes before compacting it
+    /// pays: half as much as it holds, so its cost is spread over the
+    /// walks that stepped over the waste.
+    fn budget(&self) -> usize {
+        WASTE.max(self.cost() / 2)
+    }
+
+    /// Drops every consumed entry if walks have wasted the list's budget on
+    /// them. Returns whether the list is now empty.
+    fn compact(&mut self, log: &Log) -> bool {
+        if *self.waste.get_mut() >= self.budget() {
+            let skip = std::mem::take(self.skip.get_mut());
+            self.seqs.drain(..skip);
+            self.seqs.retain(|&s| !consumed(log, s));
+            *self.waste.get_mut() = 0;
+            self.shrink();
+        }
+        self.seqs.is_empty()
     }
 
     /// Drops the consumed prefix and every seq outside `live`. Returns
@@ -103,10 +166,14 @@ impl Posting {
         self.seqs.drain(..*self.skip.get_mut());
         *self.skip.get_mut() = 0;
         self.seqs.retain(|s| is_live(live, *s));
+        self.shrink();
+        self.seqs.is_empty()
+    }
+
+    fn shrink(&mut self) {
         if self.seqs.capacity() > 4 * self.seqs.len().max(4) {
             self.seqs.shrink_to_fit();
         }
-        self.seqs.is_empty()
     }
 }
 
@@ -180,6 +247,9 @@ pub(crate) struct Index {
     /// `d` tag.
     slots: HashMap<Slot, HashMap<Box<[u8]>, Version>>,
     seen: Seen,
+    /// Set by a walk that left some posting list wanting
+    /// [`compact`](Index::compact)ing.
+    wasteful: AtomicBool,
 }
 
 impl Index {
@@ -196,6 +266,7 @@ impl Index {
                 order: VecDeque::new(),
                 set: HashSet::new(),
             },
+            wasteful: AtomicBool::new(false),
         }
     }
 
@@ -228,20 +299,32 @@ impl Index {
     /// before. A record that is already consumed goes in `ids` and `slots`
     /// only.
     ///
-    /// If the event's kind replaces and another version of it is indexed,
-    /// returns the seq of whichever of the two lost: the older one, or this
-    /// one if it is the older.
+    /// Returns the seq of a record that lost to this one and should die:
+    /// an earlier copy of the same event, which compaction leaves behind
+    /// (see [`id_at`](Self::id_at)), or else, if the event's kind replaces
+    /// and another version of it is indexed, whichever of the two is older,
+    /// which may be this one.
     pub(crate) fn insert(&mut self, note: &NoteRef<'_>, seq: Seq, pending: bool) -> Option<Seq> {
-        self.ids.insert(*note.id(), seq);
+        let copied = self.id_at(note.id(), seq);
         let lost = self.place(note, seq);
         if pending {
             self.post(note, seq);
         }
-        lost
+        copied.or(lost)
     }
 
-    /// Makes `note` its slot's newest version, if it is newer.
-    fn place(&mut self, note: &NoteRef<'_>, seq: Seq) -> Option<Seq> {
+    /// Records that event `id` is at `seq`, which must be past every seq
+    /// indexed before. Returns where it was before, if it was in the log
+    /// already: only compaction copies an event, and the earlier copy is
+    /// garbage.
+    pub(crate) fn id_at(&mut self, id: &[u8; 32], seq: Seq) -> Option<Seq> {
+        self.ids.insert(*id, seq)
+    }
+
+    /// Makes `note` its slot's newest version, if it is newer, or moves the
+    /// slot to `seq` if `note` is its version already (a copy). Returns
+    /// whichever version lost, if another one is indexed.
+    pub(crate) fn place(&mut self, note: &NoteRef<'_>, seq: Seq) -> Option<Seq> {
         let (key, d) = slot(note)?;
         let v = Version {
             created_at: note.created_at(),
@@ -254,6 +337,10 @@ impl Index {
                 versions.insert(Box::from(d), v);
                 None
             }
+            Some(cur) if cur.id == v.id => {
+                cur.seq = seq;
+                None
+            }
             Some(cur) if v.beats(cur) => Some(std::mem::replace(cur, v).seq),
             Some(_) => Some(seq),
         }
@@ -261,20 +348,22 @@ impl Index {
 
     /// Adds a pending record to its posting lists.
     fn post(&mut self, note: &NoteRef<'_>, seq: Seq) {
-        self.authors.entry(*note.pubkey()).or_default().push(seq);
-        self.kinds.entry(note.kind()).or_default().push(seq);
-        for tag in note.tags() {
-            let (Some(&[letter]), Some(value)) = (tag.get(0), tag.get(1)) else {
-                continue;
-            };
-            if !letter.is_ascii_alphabetic() {
-                continue;
-            }
-            let values = self.tags.entry(letter).or_default();
-            // get_mut first so an existing key doesn't cost an allocation.
-            match values.get_mut(value) {
-                Some(p) => p.push(seq),
-                None => values.entry(Box::from(value)).or_default().push(seq),
+        keys(note, |key| self.post_key(key, seq));
+    }
+
+    /// Adds a pending record to `key`'s posting list. `seq` must be past
+    /// every seq in it.
+    pub(crate) fn post_key(&mut self, key: Key<'_>, seq: Seq) {
+        match key {
+            Key::Author(pubkey) => self.authors.entry(*pubkey).or_default().push(seq),
+            Key::Kind(kind) => self.kinds.entry(kind).or_default().push(seq),
+            Key::Tag(letter, value) => {
+                let values = self.tags.entry(letter).or_default();
+                // get_mut first so an existing key doesn't cost an allocation.
+                match values.get_mut(value) {
+                    Some(p) => p.push(seq),
+                    None => values.entry(Box::from(value)).or_default().push(seq),
+                }
             }
         }
     }
@@ -294,6 +383,25 @@ impl Index {
         self.kinds.retain(|_, p| !p.trim(live));
         self.tags.retain(|_, values| {
             values.retain(|_, p| !p.trim(live));
+            !values.is_empty()
+        });
+    }
+
+    /// Whether a walk left some posting list wanting [`compact`]ing.
+    ///
+    /// [`compact`]: Self::compact
+    pub(crate) fn wasteful(&self) -> bool {
+        self.wasteful.load(Ordering::Relaxed)
+    }
+
+    /// Drops the consumed entries from every posting list that walks have
+    /// stepped over at least as many of as it holds.
+    pub(crate) fn compact(&mut self, log: &Log) {
+        *self.wasteful.get_mut() = false;
+        self.authors.retain(|_, p| !p.compact(log));
+        self.kinds.retain(|_, p| !p.compact(log));
+        self.tags.retain(|_, values| {
+            values.retain(|_, p| !p.compact(log));
             !values.is_empty()
         });
     }
@@ -338,8 +446,9 @@ impl Index {
 
     /// Fills `out` with the first `n` candidate seqs in `range` for `plan`,
     /// ascending. Fewer than `n` means there are no more. Candidates
-    /// may be consumed or not match the rest of the filter; the caller
-    /// checks both.
+    /// may be leased or not match the rest of the filter; the caller
+    /// checks both. A posting list's consumed entries are skipped, and
+    /// counted towards [`wasteful`](Self::wasteful).
     pub(crate) fn candidates(
         &self,
         log: &Log,
@@ -350,6 +459,10 @@ impl Index {
         out: &mut Vec<Seq>,
     ) {
         out.clear();
+        let mut wasteful = false;
+        let mut collect = |p: &Posting, out: &mut Vec<Seq>| {
+            wasteful |= p.collect(log, &range, n, out);
+        };
         match plan {
             Plan::Empty | Plan::Scan => return,
             Plan::Ids => out.extend(
@@ -363,7 +476,7 @@ impl Index {
                 if let (Some(c), Some(values)) = (f.get_tag(letter), self.tags.get(&letter)) {
                     for v in &c.values {
                         if let Some(p) = values.get(v) {
-                            p.collect(log, &range, n, out);
+                            collect(p, out);
                         }
                     }
                 }
@@ -371,17 +484,20 @@ impl Index {
             Plan::Authors => {
                 for a in f.get_authors().unwrap_or_default() {
                     if let Some(p) = self.authors.get(a) {
-                        p.collect(log, &range, n, out);
+                        collect(p, out);
                     }
                 }
             }
             Plan::Kinds => {
                 for k in f.get_kinds().unwrap_or_default() {
                     if let Some(p) = self.kinds.get(k) {
-                        p.collect(log, &range, n, out);
+                        collect(p, out);
                     }
                 }
             }
+        }
+        if wasteful {
+            self.wasteful.store(true, Ordering::Relaxed);
         }
         // The n smallest of the union are among the first n of each list.
         out.sort_unstable();

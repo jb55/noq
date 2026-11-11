@@ -7,11 +7,18 @@
 //! only tear records in the tail, and opening the log recovers each segment
 //! by truncating at its first bad record.
 //!
+//! Sealing a segment also writes its sidecar (`.idx`, see
+//! [`crate::sidecar`]): its records and the keys they are indexed under. A
+//! sealed segment with a sound sidecar opens without a crc check, and the
+//! queue indexes it from the sidecar without parsing its records, so only
+//! the tail is scanned in full.
+//!
 //! Each segment counts its pending (LIVE or LEASED) records. When a sealed
 //! segment's count reaches zero, through [`Log::retire`], it holds only
-//! garbage: it leaves the log and its file is unlinked. The tail is never
+//! garbage: it leaves the log and its files are unlinked. The tail is never
 //! dropped, drained or not, until a rotation seals it.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,6 +31,7 @@ use crate::builder::NoteBuilder;
 use crate::error::Error;
 use crate::note::NoteRef;
 use crate::segment::{RECORD_HEADER_LEN, RecordRef, Segment, Seq, State, stride};
+use crate::sidecar::Sidecar;
 
 /// When appended records are written back to disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +79,10 @@ pub struct Log {
     segments: RwLock<Vec<Arc<Segment>>>,
     /// Segments dropped since open.
     dropped: AtomicU64,
+    /// Segments sealed since open.
+    sealed: AtomicU64,
+    /// Sidecars read on open, until the queue indexes their segments.
+    listed: Mutex<HashMap<u32, Sidecar>>,
     writer: Mutex<Writer>,
     /// Held for the log's lifetime so a second process can't open it.
     _lock: File,
@@ -89,12 +101,23 @@ impl Log {
     /// Opens the log in `dir`, creating it if needed, and recovers every
     /// segment in it.
     pub fn open(dir: impl AsRef<Path>, config: Config) -> Result<Log, Error> {
+        Log::open_listing(dir.as_ref(), config, false)
+    }
+
+    /// Like [`open`](Self::open), but keeps the sidecars it opened sealed
+    /// segments from, for the queue to index them from with
+    /// [`take_sidecar`](Self::take_sidecar).
+    pub(crate) fn open_indexed(dir: impl AsRef<Path>, config: Config) -> Result<Log, Error> {
+        Log::open_listing(dir.as_ref(), config, true)
+    }
+
+    fn open_listing(dir: &Path, config: Config, keep: bool) -> Result<Log, Error> {
         if config.segment_size < 4096 || !config.segment_size.is_multiple_of(8) {
             return Err(Error::Config(
                 "segment_size must be a multiple of 8, at least 4096",
             ));
         }
-        let dir = dir.as_ref().to_owned();
+        let dir = dir.to_owned();
         fs::create_dir_all(&dir)?;
         let lock = File::create(dir.join("LOCK"))?;
         lock.try_lock().map_err(|_| Error::Locked)?;
@@ -103,21 +126,58 @@ impl Log {
             .filter_map(|e| Segment::parse_file_name(e.ok()?.file_name().to_str()?))
             .collect();
         ids.sort_unstable();
-        let mut segments = ids
-            .into_iter()
-            .map(|id| {
-                Segment::open(&dir.join(Segment::file_name(id)), id, config.segment_size)
-                    .map(Arc::new)
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
+        let mut listed = HashMap::new();
+        let mut segments = Vec::with_capacity(ids.len());
+        let mut wrote = false;
+        for (i, &id) in ids.iter().enumerate() {
+            let path = dir.join(Segment::file_name(id));
+            let sealed = i + 1 < ids.len();
+            let sc = sealed.then(|| Sidecar::read(&dir, id)).flatten();
+            let mut seg = None;
+            if let Some(sc) = sc {
+                let offs: Vec<u32> = sc.records.iter().map(|e| e.off).collect();
+                seg = Segment::open_listed(&path, id, sc.end, &offs)?;
+                if seg.is_some() && keep {
+                    listed.insert(id, sc);
+                }
+            }
+            let listed_it = seg.is_some();
+            let seg = match seg {
+                Some(seg) => seg,
+                None => Segment::open(&path, id, config.segment_size)?,
+            };
+            // Sealed by a process that died before writing its sidecar, or
+            // one whose sidecar didn't check out.
+            if sealed && !listed_it && seg.pending() > 0 {
+                wrote |= Sidecar::build(&seg).write(&dir).is_ok();
+            }
+            segments.push(Arc::new(seg));
+        }
         if segments.is_empty() {
             segments.push(Arc::new(Segment::create(&dir, 0, config.segment_size)?));
-            sync_dir(&dir)?;
+            wrote = true;
         }
         // Drained segments left by the last process, or whose unlink failed.
         let tail_id = segments.last().unwrap().id();
         for seg in segments.extract_if(.., |s| s.id() != tail_id && s.pending() == 0) {
+            listed.remove(&seg.id());
             fs::remove_file(seg.path())?;
+        }
+        // Sidecars whose segment is gone, and half-written ones.
+        for e in fs::read_dir(&dir)? {
+            let name = e?.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let orphan = match name.strip_suffix(".idx") {
+                Some(seg) => Segment::parse_file_name(&format!("{seg}.seg"))
+                    .is_some_and(|id| segments.binary_search_by_key(&id, |s| s.id()).is_err()),
+                None => name.ends_with(".idx.tmp"),
+            };
+            if orphan {
+                let _ = fs::remove_file(dir.join(name));
+            }
+        }
+        if wrote {
+            sync_dir(&dir)?;
         }
 
         let tail = segments.last().unwrap().clone();
@@ -133,6 +193,8 @@ impl Log {
             config,
             segments: RwLock::new(segments),
             dropped: AtomicU64::new(0),
+            sealed: AtomicU64::new(0),
+            listed: Mutex::new(listed),
             _lock: lock,
         })
     }
@@ -188,6 +250,8 @@ impl Log {
     /// Seals the tail and starts the next segment.
     fn rotate(&self, w: &mut Writer) -> Result<(), Error> {
         w.tail.flush()?;
+        // Best effort: without it the segment is only slower to open.
+        let _ = Sidecar::build(&w.tail).write(&self.dir);
         let next = Arc::new(Segment::create(
             &self.dir,
             w.tail.id() + 1,
@@ -196,6 +260,7 @@ impl Log {
         sync_dir(&self.dir)?;
         self.segments.write().push(next.clone());
         let sealed = std::mem::replace(&mut w.tail, next);
+        self.sealed.fetch_add(1, Ordering::Release);
         w.synced = 0;
         w.synced_at = Instant::now();
         // Drained while it was the tail, so nothing reclaimed it then.
@@ -226,7 +291,7 @@ impl Log {
         true
     }
 
-    /// Drops `seg` from the log and unlinks its file, if it is drained and
+    /// Drops `seg` from the log and unlinks its files, if it is drained and
     /// not the tail. Records still held keep its memory mapped; the unlinked
     /// file's space comes back once the last is dropped.
     ///
@@ -248,7 +313,9 @@ impl Log {
             segs.remove(i);
             self.dropped.fetch_add(1, Ordering::Release);
         }
+        self.listed.lock().remove(&seg.id());
         let _ = fs::remove_file(seg.path());
+        let _ = fs::remove_file(Sidecar::path(&self.dir, seg.id()));
     }
 
     fn write_back(&self, w: &mut Writer) -> Result<(), Error> {
@@ -274,6 +341,17 @@ impl Log {
     /// change means some seqs are gone, not necessarily the oldest.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Acquire)
+    }
+
+    /// How many segments have been sealed since the log was opened.
+    pub fn sealed(&self) -> u64 {
+        self.sealed.load(Ordering::Acquire)
+    }
+
+    /// The sidecar segment `id` was opened from, the first time it is
+    /// asked for.
+    pub(crate) fn take_sidecar(&self, id: u32) -> Option<Sidecar> {
+        self.listed.lock().remove(&id)
     }
 
     /// The seq of the oldest segment's start. Every seq before it is gone.

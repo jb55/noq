@@ -109,6 +109,8 @@ pub struct Segment {
     /// Committed records not yet consumed: LIVE or LEASED. Once a sealed
     /// segment's count is zero it holds only garbage and can be dropped.
     pending: AtomicU32,
+    /// Committed records, of every state.
+    count: AtomicU32,
 }
 
 impl Segment {
@@ -146,6 +148,7 @@ impl Segment {
             map,
             end: AtomicU32::new(0),
             pending: AtomicU32::new(0),
+            count: AtomicU32::new(0),
         })
     }
 
@@ -169,7 +172,7 @@ impl Segment {
         let size = size as u32;
 
         let map = MmapRaw::map_raw(&file)?;
-        let (end, pending) = recover(&map);
+        let (end, pending, count) = recover(&map);
         if (end as u64) < size as u64 {
             // Zero the rest. A record past the end can be intact on disk
             // while one before it was torn (pages reach disk in any order),
@@ -189,7 +192,64 @@ impl Segment {
             map,
             end: AtomicU32::new(end),
             pending: AtomicU32::new(pending),
+            count: AtomicU32::new(count),
         })
+    }
+
+    /// Opens a sealed segment whose records a sidecar listed: they start at
+    /// `offs` and end at `end`. Nothing is crc checked, since the segment
+    /// was written back in full before its sidecar was written; the headers
+    /// are only checked to tile `[0, end)` exactly, as `offs` says, and each
+    /// span index to be sound, so [`RecordRef::note`] can't fail. Records
+    /// left LEASED go back to LIVE.
+    ///
+    /// Returns `None` if the headers disagree with `offs` and `end`: the
+    /// caller should [`open`](Self::open) it instead.
+    pub(crate) fn open_listed(
+        path: &Path,
+        id: u32,
+        end: u32,
+        offs: &[u32],
+    ) -> Result<Option<Segment>, Error> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let size = file.metadata()?.len();
+        if size > u32::MAX as u64 || (end as u64) > size {
+            return Ok(None);
+        }
+        let map = MmapRaw::map_raw(&file)?;
+        let seg = Segment {
+            id,
+            path: path.to_owned(),
+            file,
+            map,
+            end: AtomicU32::new(end),
+            pending: AtomicU32::new(0),
+            count: AtomicU32::new(offs.len() as u32),
+        };
+        let mut next = 0;
+        let mut pending = 0;
+        for &off in offs {
+            let Some(r) = seg
+                .record(off)
+                .filter(|r| off == next && NoteRef::new(r.index, r.json).is_ok())
+            else {
+                return Ok(None);
+            };
+            // Not shared yet: nobody else can be moving these.
+            r.cas_state(State::Leased, State::Live);
+            if r.state() == State::Live {
+                pending += 1;
+            }
+            next = r.next();
+        }
+        let past_end = end as usize + RECORD_HEADER_LEN <= seg.map.len()
+            // SAFETY: the header-sized range at `end` is inside the map.
+            && unsafe { read_u32(seg.map.as_ptr().add(end as usize)) } != 0;
+        if next != end || past_end {
+            return Ok(None);
+        }
+        seg.pending.store(pending, Ordering::Release);
+        Ok(Some(seg))
     }
 
     pub fn id(&self) -> u32 {
@@ -218,6 +278,11 @@ impl Segment {
     /// Committed records still LIVE or LEASED.
     pub fn pending(&self) -> u32 {
         self.pending.load(Ordering::Acquire)
+    }
+
+    /// Committed records, of every state.
+    pub fn count(&self) -> u32 {
+        self.count.load(Ordering::Acquire)
     }
 
     /// Counts one record out of [`pending`](Self::pending), after the
@@ -324,6 +389,7 @@ impl Segment {
         }
         // Counted before it is visible, so a consumer can't release it first.
         self.pending.fetch_add(1, Ordering::AcqRel);
+        self.count.fetch_add(1, Ordering::AcqRel);
         self.end
             .store(off + stride(total_len) as u32, Ordering::Release);
         Some(Seq::new(self.id, off))
@@ -439,14 +505,15 @@ fn record_crc(header: &[u8; RECORD_HEADER_LEN], index: &[u8], json: &[u8]) -> u3
 }
 
 /// Walks the records from the start and returns where the good ones end,
-/// and how many of them are still LIVE. Runs before anyone else can see the
-/// segment.
-fn recover(map: &MmapRaw) -> (u32, u32) {
+/// how many of them are still LIVE, and how many there are. Runs before
+/// anyone else can see the segment.
+fn recover(map: &MmapRaw) -> (u32, u32, u32) {
     // SAFETY: the segment is not shared yet, so nothing else reads or
     // writes the map while we hold this slice.
     let buf = unsafe { std::slice::from_raw_parts_mut(map.as_mut_ptr(), map.len()) };
     let mut off = 0usize;
     let mut pending = 0;
+    let mut records = 0;
     while off + RECORD_HEADER_LEN <= buf.len() {
         let rec = &buf[off..];
         let total_len = read_le_u32(rec) as usize;
@@ -459,9 +526,10 @@ fn recover(map: &MmapRaw) -> (u32, u32) {
         if buf[off + OFF_STATE] == State::Live as u8 {
             pending += 1;
         }
+        records += 1;
         off += stride(total_len);
     }
-    (off.min(buf.len()) as u32, pending)
+    (off.min(buf.len()) as u32, pending, records)
 }
 
 /// Whether the record at the start of `rec` is whole and intact.
