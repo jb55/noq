@@ -1,8 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="noq">
 <title>noq</title>
-<rect width="128" height="128" rx="28" fill="#f5a524"/>
-<g fill="#16121d">
-<path d="M64 22a31 31 0 1 0 0 62a31 31 0 1 0 0-62zm0 16.5a14.5 14.5 0 1 1 0 29a14.5 14.5 0 1 1 0-29z"/>
-<path d="M78 22h17v75.5a8.5 8.5 0 0 1 -17 0z"/>
-</g>
+<rect width="128" height="128" rx="28" fill="#16121d"/>
+<circle cx="64" cy="60" r="28" fill="none" stroke="#ece6f7" stroke-width="16"/>
+<path d="M80 76l22 22" stroke="#16121d" stroke-width="30" stroke-linecap="round"/>
+<path d="M80 76l22 22" stroke="#f5a524" stroke-width="16" stroke-linecap="round"/>
 </svg>
