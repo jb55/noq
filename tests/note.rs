@@ -247,9 +247,8 @@ fn malformed_events_rejected() {
     bad(&raw.replace("[[\"e\",\"x\"]]", "[\"e\"]"));
     bad(&raw.replace("\"hi\"", "\"h\ni\""));
     bad(&raw.replace("\"hi\"", r#""h\qi""#));
-    bad(&raw
-        .replace("\"hi\"", r#""h\ud800i""#)
-        .replace("\"x\"", r#""\ud800""#));
+    bad(&raw.replace("\"hi\"", r#""h\ud800i""#));
+    bad(&raw.replace("\"x\"", r#""\ud800""#));
     bad(&(raw.clone() + "x"));
     bad(&raw[..raw.len() - 1]);
     let id = ev["id"].as_str().unwrap();
@@ -257,6 +256,53 @@ fn malformed_events_rejected() {
     bad(&raw.replace(id, &id[1..]));
     assert_eq!(build("{}"), Err(Error::Missing("id")));
     assert_eq!(build_note(b"{\"id\":\"\xff\"}"), Err(Error::Utf8));
+}
+
+/// A content escape that is well-shaped but decodes to no character.
+const LONE_SURROGATES: [&str; 3] = [r"\ud800", r"\ude00", r"\ud83dA"];
+
+#[test]
+fn lone_surrogate_in_content_rejected() {
+    let z = |n| "0".repeat(n);
+    let signed = sign(1700000000, 1, json!([["e", "x"]]), "hi").to_string();
+    for esc in LONE_SURROGATES {
+        let garbage = format!(
+            r#"{{"id":"{}","pubkey":"{}","created_at":1,"kind":1,"tags":[],"content":"{esc}","sig":"{}"}}"#,
+            z(64),
+            z(64),
+            z(128)
+        );
+        // A real signature over other content: the parse must fail before
+        // the id hash, not at it.
+        let resigned = signed.replace("\"hi\"", &format!("\"{esc}\""));
+        for raw in [&garbage, &resigned] {
+            let json = |r: Result<(), Error>| matches!(r, Err(Error::Json { .. }));
+            assert!(json(build(raw).map(drop)), "build accepted {raw}");
+            let mut out = vec![];
+            let r = NoteBuilder::new().build_unverified(raw.as_bytes(), &mut out);
+            assert!(json(r), "build_unverified accepted {raw}");
+            assert!(out.is_empty());
+        }
+    }
+}
+
+#[test]
+fn escaped_content_after_escaped_tags() {
+    // The content check decodes into the side buffer the tag values live
+    // in; it must leave them as they were.
+    let raw = format!(
+        r#"{{"id":"{0}","pubkey":"{0}","created_at":1,"kind":1,"tags":[["q","a\nb"],["t","\u00e9"]],"content":"c\ud83d\ude00\"d","sig":"{1}"}}"#,
+        "0".repeat(64),
+        "0".repeat(128)
+    );
+    let mut out = vec![];
+    NoteBuilder::new()
+        .build_unverified(raw.as_bytes(), &mut out)
+        .unwrap();
+    let note = NoteRef::new(&out, raw.as_bytes()).unwrap();
+    assert_eq!(note.tag(0).unwrap().str(1).unwrap(), "a\nb");
+    assert_eq!(note.tag(1).unwrap().str(1).unwrap(), "é");
+    assert_eq!(note.content(), "c😀\"d");
 }
 
 #[test]

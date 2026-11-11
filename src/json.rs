@@ -3,7 +3,8 @@
 //! It walks the json once, decodes the fixed fields, and records every tag
 //! value as a [`Span`] into the json. Only a value containing a backslash is
 //! copied, unescaped, into the Side buffer. Content is recorded as a raw
-//! span, escapes and all; the id hash unescapes it into scratch.
+//! span, escapes and all, after a decode into scratch has checked them;
+//! the id hash unescapes it again.
 //!
 //! The parser is strict JSON (no raw control characters in strings, no
 //! leading zeros, no trailing garbage) and strict nostr: the seven fields
@@ -114,7 +115,18 @@ pub(crate) fn parse_event(json: &[u8], tags: &mut TagSections) -> Result<Fields,
                     F_TAGS
                 }
                 b"content" => {
-                    let (s, e, _) = p.string()?;
+                    let (s, e, escaped) = p.string()?;
+                    if escaped {
+                        // The span stays raw, but its escapes must decode
+                        // (no lone surrogates), since the id hash and
+                        // NoteRef::content unescape it later and trust it.
+                        // The side buffer is scratch here: what this
+                        // appends is cut off again.
+                        let mark = tags.side.len();
+                        let r = unescape(&json[s..e], &mut tags.side);
+                        tags.side.truncate(mark);
+                        r.map_err(|what| p.err_at(s, what))?;
+                    }
                     f.content = Span::json(s as u32, (e - s) as u32);
                     F_CONTENT
                 }
