@@ -7,8 +7,6 @@
 //!   not. It is the dedup check on push, and the `ids` clause's lookup.
 //! - posting lists for `authors`, `kinds` and single-letter `#tag` values:
 //!   the seqs of pending records with that key, in arrival order.
-//! - `slots`: for replaceable and addressable events, the newest version in
-//!   the log per author, kind and `d` tag, consumed or not.
 //! - `seen`: a bounded ring of ids the log has dropped, so dedup outlives
 //!   the records it checks against.
 //!
@@ -21,14 +19,13 @@
 //! wherever it is, [`Index::trim`] cuts every list (and `ids`) back to what
 //! is left, and moves the forgotten ids to `seen`.
 
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::filter::Filter;
 use crate::log::Log;
-use crate::note::{KindClass, NoteRef};
+use crate::note::NoteRef;
 use crate::segment::{Seq, State};
 
 /// How a query finds its candidates, picked by [`Index::plan`].
@@ -187,36 +184,6 @@ fn consumed(log: &Log, seq: Seq) -> bool {
         .is_none_or(|r| matches!(r.state(), State::Acked | State::Dead))
 }
 
-/// One version of a replaceable or addressable event.
-#[derive(Clone, Copy)]
-struct Version {
-    created_at: u64,
-    id: [u8; 32],
-    seq: Seq,
-}
-
-impl Version {
-    /// NIP-01: the later `created_at` wins, and on a tie the lower id.
-    fn beats(&self, other: &Version) -> bool {
-        (self.created_at, Reverse(self.id)) > (other.created_at, Reverse(other.id))
-    }
-}
-
-/// A replaceable or addressable event's author and kind; with a `d` tag,
-/// where its versions compete.
-type Slot = ([u8; 32], u32);
-
-/// Where `note`'s versions compete, if its kind replaces: its author and
-/// kind, then its `d` tag (empty for a replaceable kind).
-fn slot<'a>(note: &NoteRef<'a>) -> Option<(Slot, &'a [u8])> {
-    let key = (*note.pubkey(), note.kind());
-    match KindClass::of(note.kind()) {
-        KindClass::Replaceable => Some((key, b"")),
-        KindClass::Addressable => Some((key, note.d_tag())),
-        _ => None,
-    }
-}
-
 /// Ids the log has dropped, at most `cap`, the oldest forgotten first.
 struct Seen {
     cap: usize,
@@ -243,9 +210,6 @@ pub(crate) struct Index {
     kinds: HashMap<u32, Posting>,
     /// Keyed by letter, then by the tag's first value.
     tags: HashMap<u8, HashMap<Box<[u8]>, Posting>>,
-    /// The newest version per [`slot`]: keyed by author and kind, then by
-    /// `d` tag.
-    slots: HashMap<Slot, HashMap<Box<[u8]>, Version>>,
     seen: Seen,
     /// Set by a walk that left some posting list wanting
     /// [`compact`](Index::compact)ing.
@@ -260,7 +224,6 @@ impl Index {
             authors: HashMap::new(),
             kinds: HashMap::new(),
             tags: HashMap::new(),
-            slots: HashMap::new(),
             seen: Seen {
                 cap: seen_ids,
                 order: VecDeque::new(),
@@ -281,69 +244,32 @@ impl Index {
         self.seen.set.contains(id)
     }
 
-    /// The seq of an indexed version that replaces `note`, if its kind
-    /// replaces and a newer version than it is in the log. `note` itself
-    /// being indexed doesn't count.
-    pub(crate) fn newer(&self, note: &NoteRef<'_>) -> Option<Seq> {
-        let (key, d) = slot(note)?;
-        let cur = self.slots.get(&key)?.get(d)?;
-        let v = Version {
-            created_at: note.created_at(),
-            id: *note.id(),
-            seq: Seq(0),
-        };
-        cur.beats(&v).then_some(cur.seq)
-    }
-
     /// Indexes the record at `seq`, which must be past every seq indexed
-    /// before. A record that is already consumed goes in `ids` and `slots`
-    /// only.
+    /// before. A record that is already consumed goes in `ids` only.
     ///
-    /// Returns the seq of a record that lost to this one and should die:
-    /// an earlier copy of the same event, which compaction leaves behind
-    /// (see [`id_at`](Self::id_at)), or else, if the event's kind replaces
-    /// and another version of it is indexed, whichever of the two is older,
-    /// which may be this one.
+    /// Returns the seq of an earlier copy of the same event, which
+    /// compaction leaves behind (see [`id_at`](Self::id_at)) and which
+    /// should die.
     pub(crate) fn insert(&mut self, note: &NoteRef<'_>, seq: Seq, pending: bool) -> Option<Seq> {
         let copied = self.id_at(note.id(), seq);
-        let lost = self.place(note, seq);
         if pending {
             self.post(note, seq);
         }
-        copied.or(lost)
+        copied
     }
 
     /// Records that event `id` is at `seq`, which must be past every seq
     /// indexed before. Returns where it was before, if it was in the log
     /// already: only compaction copies an event, and the earlier copy is
-    /// garbage.
+    /// garbage, unless the move was undone (see [`id_back`](Self::id_back)).
     pub(crate) fn id_at(&mut self, id: &[u8; 32], seq: Seq) -> Option<Seq> {
         self.ids.insert(*id, seq)
     }
 
-    /// Makes `note` its slot's newest version, if it is newer, or moves the
-    /// slot to `seq` if `note` is its version already (a copy). Returns
-    /// whichever version lost, if another one is indexed.
-    pub(crate) fn place(&mut self, note: &NoteRef<'_>, seq: Seq) -> Option<Seq> {
-        let (key, d) = slot(note)?;
-        let v = Version {
-            created_at: note.created_at(),
-            id: *note.id(),
-            seq,
-        };
-        let versions = self.slots.entry(key).or_default();
-        match versions.get_mut(d) {
-            None => {
-                versions.insert(Box::from(d), v);
-                None
-            }
-            Some(cur) if cur.id == v.id => {
-                cur.seq = seq;
-                None
-            }
-            Some(cur) if v.beats(cur) => Some(std::mem::replace(cur, v).seq),
-            Some(_) => Some(seq),
-        }
+    /// Points event `id` back at `seq`, an earlier copy of it that outlived
+    /// the later one: a move that compaction undid.
+    pub(crate) fn id_back(&mut self, id: &[u8; 32], seq: Seq) {
+        self.ids.insert(*id, seq);
     }
 
     /// Adds a pending record to its posting lists.
@@ -375,10 +301,6 @@ impl Index {
         for (id, _) in self.ids.extract_if(|_, s| !is_live(live, *s)) {
             self.seen.insert(id);
         }
-        self.slots.retain(|_, versions| {
-            versions.retain(|_, v| is_live(live, v.seq));
-            !versions.is_empty()
-        });
         self.authors.retain(|_, p| !p.trim(live));
         self.kinds.retain(|_, p| !p.trim(live));
         self.tags.retain(|_, values| {

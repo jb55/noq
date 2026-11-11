@@ -14,13 +14,13 @@
 //!
 //! Some items die without being consumed, moving to DEAD:
 //!
-//! - A replaceable or addressable event is replaced by a newer version of
-//!   it: pushing the newer one kills the older if nobody holds it. A held
-//!   one is left to its holder, and is killed by the first walk past it if
-//!   it comes back. An older version pushed after a newer one is dropped.
 //! - An event expires at its NIP-40 `expiration` tag, or once it is
 //!   [`Config::max_age`] old. Walks never hand out an expired item, and a
 //!   sweep run by pushes and leases kills the rest so their segments drop.
+//!
+//! Replaceable and addressable events are queued like any other: every
+//! version is delivered, in arrival order, and deciding which one is
+//! newest is the consumer's job. That is off-spec for a relay, on purpose.
 //!
 //! Every id stays known while its record is in the log, and a bounded seen
 //! ring remembers it after, so pushing a consumed event again is a no-op.
@@ -54,8 +54,8 @@ use crate::expire::{self, Expiry};
 use crate::filter::Filter;
 use crate::index::{Index, Plan};
 use crate::lease::Leases;
-use crate::log::{Config, Log, Record};
-use crate::note::{KindClass, NoteRef};
+use crate::log::{Config, Fsync, Log, Record};
+use crate::note::NoteRef;
 use crate::notify::Signal;
 use crate::segment::{Segment, Seq, State};
 use crate::sidecar::Sidecar;
@@ -80,18 +80,12 @@ thread_local! {
 pub enum Pushed {
     /// Queued at this seq.
     Queued(Seq),
-    /// Queued at `seq`, and the older version of this replaceable or
-    /// addressable event at `old`, which nobody held, is now DEAD.
-    Replaced { seq: Seq, old: Seq },
     /// An event with this id is already in the log, at this seq, queued or
     /// consumed; nothing was added.
     Duplicate(Seq),
     /// An event with this id was consumed and its record has left the log,
     /// but the seen ring remembers it; nothing was added.
     Seen,
-    /// A newer version of this replaceable or addressable event is in the
-    /// log at this seq, queued or consumed; nothing was added.
-    Stale(Seq),
     /// The event is already expired; nothing was added.
     Expired,
 }
@@ -100,7 +94,7 @@ impl Pushed {
     /// Where the event was queued, if it was.
     pub fn queued(self) -> Option<Seq> {
         match self {
-            Pushed::Queued(seq) | Pushed::Replaced { seq, .. } => Some(seq),
+            Pushed::Queued(seq) => Some(seq),
             _ => None,
         }
     }
@@ -153,19 +147,25 @@ impl Drop for Inner {
 impl Noq {
     /// Opens the queue in `dir` and indexes every record in it. Items
     /// leased when the last process exited are queued again; expired ones
-    /// and replaced versions die.
+    /// die.
     pub fn open(dir: impl AsRef<Path>, config: Config) -> Result<Noq, Error> {
         let log = Log::open_indexed(dir, config)?;
         let trimmed = AtomicU64::new(log.dropped());
         let compacted = AtomicU64::new(log.sealed());
         let mut index = Index::new(config.seen_ids);
         let expiry = Expiry::new(config.max_age);
-        // A record that lost to a later one and is still LIVE: a replaced
-        // version whose replacement's push died before killing it, or that
-        // was leased then and came back; or a copy compaction made of
-        // itself before it died.
-        let kill = |lost: Option<Seq>| {
-            if let Some(old) = lost.and_then(|s| log.get(s)) {
+        // An event in two places: compaction copied it, then died, or its
+        // sync failed, before either copy died. The later copy wins, unless
+        // it is DEAD and the earlier LIVE: an undone move, or an expired
+        // item that the sweep kills anyway.
+        let settle = |index: &mut Index, id: &[u8; 32], seq: Seq, earlier: Option<Seq>| {
+            let Some(old) = earlier.and_then(|s| log.get(s)) else {
+                return;
+            };
+            let dead = log.get(seq).is_some_and(|r| r.state() == State::Dead);
+            if dead && old.state() == State::Live {
+                index.id_back(id, old.seq());
+            } else {
                 log.retire(&old, State::Live, State::Dead);
             }
         };
@@ -179,11 +179,8 @@ impl Noq {
                     .collect();
                 for (e, &pending) in sc.records.iter().zip(&pending) {
                     let seq = Seq::new(seg.id(), e.off);
-                    kill(index.id_at(&e.id, seq));
-                    if e.replaces {
-                        let r = seg.record(e.off).expect("a listed record is committed");
-                        kill(index.place(&r.note(), seq));
-                    }
+                    let earlier = index.id_at(&e.id, seq);
+                    settle(&mut index, &e.id, seq, earlier);
                     if let (true, Some(at)) = (pending, expiry.at(e.created_at, e.expiration)) {
                         expiry.add(at, seq);
                     }
@@ -199,7 +196,8 @@ impl Noq {
             for r in seg.records(0) {
                 let note = r.note();
                 let pending = r.state() == State::Live;
-                kill(index.insert(&note, r.seq(), pending));
+                let earlier = index.insert(&note, r.seq(), pending);
+                settle(&mut index, note.id(), r.seq(), earlier);
                 if let (true, Some(at)) = (pending, expiry.of(&note)) {
                     expiry.add(at, r.seq());
                 }
@@ -230,8 +228,8 @@ impl Noq {
         &self.0.log
     }
 
-    /// Parses, verifies and queues one event, unless it is a duplicate,
-    /// expired, or older than a version of it already in the log.
+    /// Parses, verifies and queues one event, unless it is a duplicate or
+    /// expired.
     pub fn push(&self, json: &[u8]) -> Result<Pushed, Error> {
         SCRATCH.with_borrow_mut(|(builder, index)| {
             index.clear();
@@ -258,31 +256,21 @@ impl Noq {
             if expires.is_some_and(|at| at <= now) {
                 return Ok(Pushed::Expired);
             }
-            if let Some(seq) = index.newer(&note) {
-                return Ok(Pushed::Stale(seq));
-            }
             drop(index);
             let seq = inner.log.append_note(note)?;
-            let lost = inner.index.write().insert(&note, seq, true);
+            let copied = inner.index.write().insert(&note, seq, true);
+            debug_assert_eq!(copied, None, "the id was checked under the push lock");
             if let Some(at) = expires {
                 inner.expiry.add(at, seq);
             }
-            // `newer` said nothing beats this one, so what lost is older.
-            match lost.and_then(|old| Some((old, inner.log.get(old)?))) {
-                Some((old, rec)) if inner.log.retire(&rec, State::Live, State::Dead) => {
-                    Pushed::Replaced { seq, old }
-                }
-                _ => Pushed::Queued(seq),
-            }
+            Pushed::Queued(seq)
         };
-        if pushed.queued().is_some() {
-            inner.queued.bump();
-        }
+        inner.queued.bump();
         if inner.expiry.is_due(now) {
             inner.expiry.sweep(&inner.log, now);
         }
         // The append may have sealed a drained tail and dropped it, and the
-        // kills may have drained others.
+        // sweep may have drained others.
         self.trim();
         let sealed = inner.log.sealed();
         if inner.compacted.swap(sealed, Ordering::AcqRel) != sealed {
@@ -390,7 +378,7 @@ impl Noq {
 
     /// Calls `visit` with each LIVE record matching `filter` that was in the
     /// log when the walk started, in seq order, until it returns false.
-    /// Expired and replaced records it finds on the way die instead.
+    /// Expired records it finds on the way die instead.
     fn walk(&self, filter: &Filter, visit: impl FnMut(Record) -> bool) {
         let now = expire::now();
         if self.0.expiry.is_due(now) {
@@ -459,15 +447,12 @@ impl Noq {
         }
     }
 
-    /// Whether a LIVE record is expired at `now` or replaced by a newer
-    /// version, killing it if so. Pushes and sweeps kill most such records
-    /// first; this catches the ones they couldn't because they were held,
-    /// and expiries the sweep hasn't reached.
+    /// Whether a LIVE record is expired at `now`, killing it if so. The
+    /// sweep kills most such records first; this catches the ones it
+    /// couldn't because they were held, and expiries it hasn't reached.
     fn kill_if_dead(&self, rec: &Record, now: u64) -> bool {
         let inner = &self.0;
-        let note = rec.note();
-        let dead = inner.expiry.expired(&note, now)
-            || (KindClass::of(note.kind()).replaces() && inner.index.read().newer(&note).is_some());
+        let dead = inner.expiry.expired(&rec.note(), now);
         if dead {
             inner.log.retire(rec, State::Live, State::Dead);
         }
@@ -529,26 +514,28 @@ impl Noq {
     }
 
     /// Moves each LIVE item of `seg` to the tail. Returns how many moved.
+    ///
+    /// In two passes, so that no crash, power loss included, loses an
+    /// item. The first holds each item (LIVE to LEASED), so no walk takes
+    /// it while it is in two places, and appends its copy. Then the log is
+    /// synced, and only after that does any original die: until a DEAD
+    /// byte is on disk both copies are LIVE there, and reopening kills the
+    /// original when the index sees the event's id again. If the sync
+    /// fails, the copies die instead and the originals are queued again.
     fn compact_segment(&self, seg: &Segment) -> usize {
         let inner = &self.0;
         let now = expire::now();
-        let mut moved = 0;
         let _push = inner.push_lock.lock();
+        let mut moves = Vec::new();
         for r in seg.records(0) {
             if r.state() != State::Live {
                 continue;
             }
             let Some(rec) = inner.log.get(r.seq()) else {
-                return moved;
+                break;
             };
             // Not worth a copy.
-            if self.kill_if_dead(&rec, now) {
-                continue;
-            }
-            // Held, so no walk takes it while it is in two places. A crash
-            // from here until it dies leaves both copies LIVE, and reopening
-            // kills this one: the index sees the event's id again.
-            if !r.cas_state(State::Live, State::Leased) {
+            if self.kill_if_dead(&rec, now) || !r.cas_state(State::Live, State::Leased) {
                 continue;
             }
             let note = r.note();
@@ -556,7 +543,7 @@ impl Noq {
                 Ok(seq) => seq,
                 Err(_) => {
                     r.cas_state(State::Leased, State::Live);
-                    return moved;
+                    break;
                 }
             };
             let copied = inner.index.write().insert(&note, seq, true);
@@ -564,10 +551,29 @@ impl Noq {
             if let Some(at) = inner.expiry.of(&note) {
                 inner.expiry.add(at, seq);
             }
-            inner.log.retire(&rec, State::Leased, State::Dead);
-            moved += 1;
+            moves.push((rec, seq));
         }
-        moved
+        if moves.is_empty() {
+            return 0;
+        }
+        // Under `Always` every append synced already.
+        if inner.log.config().fsync != Fsync::Always && inner.log.sync().is_err() {
+            for (rec, seq) in &moves {
+                let copy = inner.log.get(*seq);
+                if copy.is_some_and(|c| inner.log.retire(&c, State::Live, State::Dead)) {
+                    rec.get().cas_state(State::Leased, State::Live);
+                    inner.index.write().id_back(rec.note().id(), rec.seq());
+                } else {
+                    // A scan took the copy already: it is the one left.
+                    inner.log.retire(rec, State::Leased, State::Dead);
+                }
+            }
+            return 0;
+        }
+        for (rec, _) in &moves {
+            inner.log.retire(rec, State::Leased, State::Dead);
+        }
+        moves.len()
     }
 
     /// Cuts the index back to the log's segments, if one was dropped since
@@ -588,8 +594,8 @@ impl Noq {
         }
     }
 
-    /// Leases the item at `seq` for `ttl`, if it is still queued and
-    /// neither expired nor replaced.
+    /// Leases the item at `seq` for `ttl`, if it is still queued and not
+    /// expired.
     pub fn lease_seq(&self, seq: Seq, ttl: Duration) -> Option<Lease> {
         let rec = self.0.log.get(seq)?;
         if rec.state() != State::Live || self.kill_if_dead(&rec, expire::now()) {
@@ -722,5 +728,66 @@ impl std::fmt::Debug for Lease {
             .field("seq", &self.seq())
             .field("deadline", &self.deadline)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_move_whose_sync_fails_is_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            segment_size: 64 << 10,
+            fsync: Fsync::Never,
+            ..Config::default()
+        };
+        let q = Noq::open(dir.path(), config).unwrap();
+        let data = std::fs::read("tests/data/many-events-sample.jsonl").unwrap();
+        let mut first = Vec::new();
+        for line in data.split(|&c| c == b'\n') {
+            if q.log().segments().len() == 2 {
+                break;
+            }
+            if let Ok(Pushed::Queued(seq)) = q.push(line) {
+                first.push((seq, line));
+            }
+        }
+        first.retain(|(s, _)| s.segment() == 0);
+        for &(s, _) in &first[2..] {
+            q.lease_seq(s, Duration::from_secs(600))
+                .unwrap()
+                .ack()
+                .unwrap();
+        }
+        let state = |s: Seq| q.log().get(s).map(|r| r.state());
+        let tail = q.log().tail_seq();
+
+        q.log().fail_sync.store(true, Ordering::Relaxed);
+        assert_eq!(q.compact(), 0);
+        // The originals are queued again, the copies dead, and the index
+        // points at the originals.
+        for &(s, json) in &first[..2] {
+            assert_eq!(state(s), Some(State::Live));
+            assert_eq!(q.push(json).unwrap(), Pushed::Duplicate(s));
+        }
+        let copies: Vec<Seq> = q.log().scan(tail).map(|r| r.seq()).collect();
+        assert_eq!(copies.len(), 2);
+        assert!(copies.iter().all(|&s| state(s) == Some(State::Dead)));
+        let queued: Vec<Seq> = q
+            .peek(&Filter::new(), usize::MAX)
+            .iter()
+            .map(|r| r.seq())
+            .filter(|s| s.segment() == 0)
+            .collect();
+        assert_eq!(queued, [first[0].0, first[1].0]);
+
+        // The next try moves them.
+        assert_eq!(q.compact(), 2);
+        for &(s, json) in &first[..2] {
+            assert_eq!(state(s), None, "segment 0 drained and dropped");
+            assert!(matches!(q.push(json).unwrap(), Pushed::Duplicate(c) if c > copies[1]));
+        }
     }
 }

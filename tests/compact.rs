@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::Signer;
-use noq::{Config, Filter, Fsync, KindClass, Log, Noq, NoteRef, Pushed, Segment, Seq, State};
+use noq::{Config, Filter, Fsync, Log, Noq, NoteRef, Pushed, Segment, Seq, State};
 
 const LONG: Duration = Duration::from_secs(600);
 
@@ -17,15 +17,6 @@ fn small() -> Config {
         fsync: Fsync::Never,
         ..Config::default()
     }
-}
-
-/// The sample's events whose kinds don't replace, so every one queues.
-fn events() -> Vec<Vec<u8>> {
-    common::sample()
-        .iter()
-        .filter(|(json, idx)| !KindClass::of(NoteRef::new(idx, json).unwrap().kind()).replaces())
-        .map(|(json, _)| json.clone())
-        .collect()
 }
 
 fn idx_path(dir: &Path, id: u32) -> PathBuf {
@@ -85,7 +76,7 @@ fn filters(evs: &[Vec<u8>]) -> Vec<Filter> {
 #[test]
 fn sealed_segments_reopen_from_their_sidecars_as_from_a_scan() {
     let dir = tempfile::tempdir().unwrap();
-    let evs = events();
+    let evs = common::events();
     let fs = filters(&evs);
     let (live, held) = {
         let q = Noq::open(dir.path(), small()).unwrap();
@@ -132,7 +123,7 @@ fn sealed_segments_reopen_from_their_sidecars_as_from_a_scan() {
 #[test]
 fn a_bad_sidecar_is_ignored_and_strays_are_removed() {
     let dir = tempfile::tempdir().unwrap();
-    let evs = events();
+    let evs = common::events();
     let fs = filters(&evs);
     let (want, segs) = {
         let q = Noq::open(dir.path(), small()).unwrap();
@@ -166,7 +157,7 @@ fn a_bad_sidecar_is_ignored_and_strays_are_removed() {
 #[test]
 fn compaction_moves_queued_items_off_a_holey_segment() {
     let dir = tempfile::tempdir().unwrap();
-    let evs = events();
+    let evs = common::events();
     let q = Noq::open(dir.path(), small()).unwrap();
     let seqs: Vec<Seq> = evs
         .iter()
@@ -184,8 +175,13 @@ fn compaction_moves_queued_items_off_a_holey_segment() {
     let (a, b) = (ids(first[1]), ids(first[2]));
     let tail = q.log().tail_seq();
 
+    // Under `Fsync::Never` too, the copies are synced before the
+    // originals die, once per segment.
+    let syncs = q.log().syncs();
     assert_eq!(q.compact(), 2);
+    assert_eq!(q.log().syncs(), syncs + 1);
     assert_eq!(q.compact(), 0, "only the held one is left");
+    assert_eq!(q.log().syncs(), syncs + 1, "nothing moved, nothing synced");
     assert_eq!(q.log().get(first[1]).unwrap().state(), State::Dead);
     let moved = q.peek(&filter(&format!(r#"{{"ids":["{a}","{b}"]}}"#)), 10);
     let moved: Vec<Seq> = moved.iter().map(|r| r.seq()).collect();
@@ -212,7 +208,7 @@ fn compaction_moves_queued_items_off_a_holey_segment() {
 #[test]
 fn sealing_compacts_the_segments_older_than_the_newest_sealed() {
     let dir = tempfile::tempdir().unwrap();
-    let evs = events();
+    let evs = common::events();
     let q = Noq::open(dir.path(), small()).unwrap();
     let mut seqs = Vec::new();
     let mut i = 0;
@@ -237,55 +233,12 @@ fn sealing_compacts_the_segments_older_than_the_newest_sealed() {
 }
 
 #[test]
-fn a_moved_replaceable_stays_the_newest_version_across_reopen() {
-    let dir = tempfile::tempdir().unwrap();
-    let alice = Signer::new(1);
-    let now = 1_700_000_000;
-    let evs = events();
-    let (seq, moved) = {
-        let q = Noq::open(dir.path(), small()).unwrap();
-        let old = alice.event(now, 0, &[], "v1");
-        let seq = q
-            .push(&alice.event(now + 1, 0, &[], "v2"))
-            .unwrap()
-            .queued()
-            .unwrap();
-        let addr = q
-            .push(&alice.event(now, 30000, &[&["d", "x"]], "a"))
-            .unwrap()
-            .queued()
-            .unwrap();
-        for e in &evs {
-            if let Some(s) = q.push(e).unwrap().queued()
-                && s.segment() == 0
-            {
-                q.lease_seq(s, LONG).unwrap().ack().unwrap();
-            }
-        }
-        // Sealing segment 1 already moved them, or this does.
-        q.compact();
-        let found = q.peek(&filter(r#"{"kinds":[0,30000]}"#), 10);
-        let moved: Vec<Seq> = found.iter().map(|r| r.seq()).collect();
-        assert!(moved.iter().all(|s| s.segment() > 0), "{moved:?}");
-        assert!(!moved.contains(&seq) && !moved.contains(&addr));
-        assert!(matches!(q.push(&old).unwrap(), Pushed::Stale(s) if s == moved[0]));
-        (seq, moved)
-    };
-    let q = Noq::open(dir.path(), small()).unwrap();
-    assert!(q.log().get(seq).is_none(), "segment 0 is gone");
-    let found = q.peek(&filter(r#"{"kinds":[0,30000]}"#), 10);
-    assert_eq!(found.iter().map(|r| r.seq()).collect::<Vec<_>>(), moved);
-    let v3 = alice.event(now + 2, 0, &[], "v3");
-    assert!(matches!(q.push(&v3).unwrap(), Pushed::Replaced { old, .. } if old == moved[0]));
-}
-
-#[test]
 fn reopen_keeps_one_copy_of_an_event_left_in_two_places() {
     // What a crash in the middle of a move leaves: the event twice, both
     // LIVE. Once in the same segment, once across a sealed one.
     for across in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let evs = events();
+        let evs = common::events();
         let (a, b) = {
             let log = Log::open(dir.path(), small()).unwrap();
             let a = log.append(&evs[0]).unwrap();
@@ -313,6 +266,40 @@ fn reopen_keeps_one_copy_of_an_event_left_in_two_places() {
                 .count(),
             1
         );
+    }
+}
+
+#[test]
+fn reopen_keeps_the_original_of_a_copy_that_died() {
+    // What a move whose sync failed leaves, if the copy's DEAD byte made it
+    // to disk: the original LIVE, the copy DEAD. A later move that worked
+    // and then crashed adds a third, LIVE copy, which wins.
+    for (across, again) in [(false, false), (true, false), (false, true), (true, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let evs = common::events();
+        let (a, c) = {
+            let log = Log::open(dir.path(), small()).unwrap();
+            let a = log.append(&evs[0]).unwrap();
+            if across {
+                for e in &evs[1..] {
+                    if log.segments().len() == 2 {
+                        break;
+                    }
+                    log.append(e).unwrap();
+                }
+            }
+            let b = log.append(&evs[0]).unwrap();
+            assert!(log.retire(&log.get(b).unwrap(), State::Live, State::Dead));
+            let c = again.then(|| log.append(&evs[0]).unwrap());
+            (a, c)
+        };
+        let q = Noq::open(dir.path(), small()).unwrap();
+        let id = common::hex(q.log().get(a).unwrap().note().id());
+        let found = q.peek(&filter(&format!(r#"{{"ids":["{id}"]}}"#)), 10);
+        let found: Vec<Seq> = found.iter().map(|r| r.seq()).collect();
+        assert_eq!(found, [c.unwrap_or(a)], "across {across} again {again}");
+        let a_state = q.log().get(a).unwrap().state();
+        assert_eq!(a_state, if again { State::Dead } else { State::Live });
     }
 }
 
@@ -363,7 +350,7 @@ fn compaction_racing_consumers_never_hands_an_event_out_twice() {
 
     let dir = tempfile::tempdir().unwrap();
     let q = Noq::open(dir.path(), small()).unwrap();
-    let evs = events();
+    let evs = common::events();
     for e in &evs {
         q.push(e).unwrap();
     }

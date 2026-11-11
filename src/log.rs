@@ -81,6 +81,11 @@ pub struct Log {
     dropped: AtomicU64,
     /// Segments sealed since open.
     sealed: AtomicU64,
+    /// Calls to [`Log::sync`] that wrote back, since open.
+    syncs: AtomicU64,
+    /// Fails the next [`Log::sync`].
+    #[cfg(test)]
+    pub(crate) fail_sync: std::sync::atomic::AtomicBool,
     /// Sidecars read on open, until the queue indexes their segments.
     listed: Mutex<HashMap<u32, Sidecar>>,
     writer: Mutex<Writer>,
@@ -194,6 +199,9 @@ impl Log {
             segments: RwLock::new(segments),
             dropped: AtomicU64::new(0),
             sealed: AtomicU64::new(0),
+            syncs: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_sync: Default::default(),
             listed: Mutex::new(listed),
             _lock: lock,
         })
@@ -329,7 +337,19 @@ impl Log {
     /// Writes every appended record back to disk now.
     pub fn sync(&self) -> Result<(), Error> {
         let mut w = self.writer.lock();
-        self.write_back(&mut w)
+        #[cfg(test)]
+        if self.fail_sync.swap(false, Ordering::Relaxed) {
+            return Err(std::io::Error::other("injected").into());
+        }
+        self.write_back(&mut w)?;
+        self.syncs.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// How many [`sync`](Self::sync) calls have written back since the log
+    /// was opened.
+    pub fn syncs(&self) -> u64 {
+        self.syncs.load(Ordering::Relaxed)
     }
 
     /// A snapshot of the segments, oldest first.

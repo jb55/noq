@@ -5,7 +5,7 @@ mod common;
 use std::time::{Duration, SystemTime};
 
 use common::Signer;
-use noq::{Config, Filter, Fsync, Log, Noq, Pushed, Seq, State};
+use noq::{Config, Filter, Fsync, Noq, Pushed, Seq, State};
 
 const LONG: Duration = Duration::from_secs(600);
 
@@ -38,145 +38,46 @@ fn peek(q: &Noq, json: &str) -> Vec<Seq> {
 }
 
 #[test]
-fn newer_replaceable_kills_the_older_and_an_older_is_stale() {
+fn every_version_of_a_replaceable_or_addressable_event_is_queued() {
     let dir = tempfile::tempdir().unwrap();
     let q = Noq::open(dir.path(), small()).unwrap();
     let s = Signer::new(1);
+    // Newer first: the older one pushed after it is queued too.
+    let v2 = queued(q.push(&s.event(200, 0, &[], "v2")).unwrap());
     let v1 = queued(q.push(&s.event(100, 0, &[], "v1")).unwrap());
-    let Pushed::Replaced { seq: v2, old } = q.push(&s.event(200, 0, &[], "v2")).unwrap() else {
-        panic!("v2 didn't replace v1")
-    };
-    assert_eq!(old, v1);
-    assert_eq!(state(&q, v1), State::Dead);
-    assert_eq!(peek(&q, r#"{"kinds":[0]}"#), [v2]);
-
-    // Older than what is queued: dropped.
-    assert_eq!(
-        q.push(&s.event(150, 0, &[], "late")).unwrap(),
-        Pushed::Stale(v2)
-    );
-    // Another author's, and another replaceable kind, are their own slots.
-    queued(q.push(&Signer::new(2).event(50, 0, &[], "")).unwrap());
-    queued(q.push(&s.event(50, 3, &[], "")).unwrap());
-    queued(q.push(&s.event(50, 10002, &[], "")).unwrap());
-    assert_eq!(peek(&q, r#"{"kinds":[0,3,10002]}"#).len(), 4);
-}
-
-#[test]
-fn a_created_at_tie_goes_to_the_lower_id() {
-    let dir = tempfile::tempdir().unwrap();
-    let q = Noq::open(dir.path(), small()).unwrap();
-    let s = Signer::new(1);
-    let mut evs = [s.event(100, 0, &[], "a"), s.event(100, 0, &[], "b")];
-    let id = |e: &[u8]| serde_json::from_slice::<serde_json::Value>(e).unwrap()["id"].clone();
-    evs.sort_by_key(|e| id(e).as_str().unwrap().to_owned());
-    // The higher id first: the lower one replaces it.
-    let hi = queued(q.push(&evs[1]).unwrap());
-    let lo = queued(q.push(&evs[0]).unwrap());
-    assert_eq!(state(&q, hi), State::Dead);
-    assert_eq!(state(&q, lo), State::Live);
-
-    let dir = tempfile::tempdir().unwrap();
-    let q = Noq::open(dir.path(), small()).unwrap();
-    let lo2 = queued(q.push(&evs[0]).unwrap());
-    assert_eq!(q.push(&evs[1]).unwrap(), Pushed::Stale(lo2));
-    assert_eq!(state(&q, lo2), State::Live);
-}
-
-#[test]
-fn addressable_versions_compete_per_d_tag() {
-    let dir = tempfile::tempdir().unwrap();
-    let q = Noq::open(dir.path(), small()).unwrap();
-    let s = Signer::new(1);
+    let x2 = queued(q.push(&s.event(200, 30023, &[&["d", "x"]], "")).unwrap());
     let x1 = queued(q.push(&s.event(100, 30023, &[&["d", "x"]], "")).unwrap());
-    let y1 = queued(q.push(&s.event(100, 30023, &[&["d", "y"]], "")).unwrap());
-    let none = queued(q.push(&s.event(100, 30023, &[], "")).unwrap());
-    let x2 = q.push(&s.event(200, 30023, &[&["d", "x"]], "")).unwrap();
-    assert!(matches!(x2, Pushed::Replaced { old, .. } if old == x1));
-    // No d tag and a d tag with no value are both the empty d.
-    let empty = q.push(&s.event(200, 30023, &[&["d"]], "")).unwrap();
-    assert!(matches!(empty, Pushed::Replaced { old, .. } if old == none));
-    assert_eq!(state(&q, y1), State::Live);
-    assert_eq!(
-        peek(&q, r#"{"kinds":[30023]}"#),
-        [y1, x2.queued().unwrap(), empty.queued().unwrap()]
-    );
-}
-
-#[test]
-fn ephemeral_and_regular_kinds_are_all_queued() {
-    let dir = tempfile::tempdir().unwrap();
-    let q = Noq::open(dir.path(), small()).unwrap();
-    let s = Signer::new(1);
-    for kind in [1, 20001] {
-        queued(q.push(&s.event(100, kind, &[], "a")).unwrap());
-        queued(q.push(&s.event(200, kind, &[], "b")).unwrap());
-    }
-    assert_eq!(peek(&q, "{}").len(), 4);
-}
-
-#[test]
-fn a_held_version_is_left_to_its_holder_and_dies_if_it_comes_back() {
-    let dir = tempfile::tempdir().unwrap();
-    let q = Noq::open(dir.path(), small()).unwrap();
-    let s = Signer::new(1);
-    let v1 = queued(q.push(&s.event(100, 0, &[], "v1")).unwrap());
-    let held = q.lease_seq(v1, LONG).unwrap();
-    // Taken, so not replaced: both are delivered.
-    let v2 = queued(q.push(&s.event(200, 0, &[], "v2")).unwrap());
-    assert_eq!(
-        q.push(&s.event(200, 0, &[], "v2")).unwrap(),
-        Pushed::Duplicate(v2)
-    );
-    assert_eq!(state(&q, v1), State::Leased);
-    held.nack().unwrap();
-    // Back in the queue, but the first walk past it kills it.
-    assert_eq!(state(&q, v1), State::Live);
-    assert_eq!(peek(&q, r#"{"kinds":[0]}"#), [v2]);
-    assert_eq!(state(&q, v1), State::Dead);
-    assert!(q.lease_seq(v1, LONG).is_none());
-}
-
-#[test]
-fn a_consumed_newer_version_still_makes_an_older_one_stale() {
-    let dir = tempfile::tempdir().unwrap();
-    let q = Noq::open(dir.path(), small()).unwrap();
-    let s = Signer::new(1);
-    let v2 = queued(q.push(&s.event(200, 0, &[], "v2")).unwrap());
-    q.lease_seq(v2, LONG).unwrap().ack().unwrap();
+    // Ephemeral and regular kinds, as ever.
+    let e = queued(q.push(&s.event(100, 20001, &[], "")).unwrap());
+    let r = queued(q.push(&s.event(100, 1, &[], "")).unwrap());
+    // Still deduplicated by id.
     assert_eq!(
         q.push(&s.event(100, 0, &[], "v1")).unwrap(),
-        Pushed::Stale(v2)
+        Pushed::Duplicate(v1)
     );
-    drop(q);
-    let q = Noq::open(dir.path(), small()).unwrap();
-    assert_eq!(
-        q.push(&s.event(100, 0, &[], "v1")).unwrap(),
-        Pushed::Stale(v2)
-    );
+    let leased: Vec<Seq> = q
+        .lease(&Filter::new(), usize::MAX, LONG)
+        .iter()
+        .map(|l| l.seq())
+        .collect();
+    assert_eq!(leased, [v2, v1, x2, x1, e, r]);
 }
 
 #[test]
-fn reopen_kills_versions_left_live_in_either_order() {
+fn reopen_keeps_every_version() {
     let dir = tempfile::tempdir().unwrap();
     let s = Signer::new(1);
-    // Appended to the log directly, as if a push died between appending a
-    // newer version and killing the older.
-    let (old_first, new_second, new_first, old_second) = {
-        let log = Log::open(dir.path(), small()).unwrap();
-        (
-            log.append(&s.event(100, 0, &[], "")).unwrap(),
-            log.append(&s.event(200, 0, &[], "")).unwrap(),
-            log.append(&s.event(200, 30000, &[&["d", "a"]], ""))
-                .unwrap(),
-            log.append(&s.event(100, 30000, &[&["d", "a"]], ""))
-                .unwrap(),
-        )
+    let seqs = {
+        let q = Noq::open(dir.path(), small()).unwrap();
+        [
+            queued(q.push(&s.event(200, 0, &[], "")).unwrap()),
+            queued(q.push(&s.event(100, 0, &[], "")).unwrap()),
+            queued(q.push(&s.event(100, 30000, &[&["d", "a"]], "")).unwrap()),
+            queued(q.push(&s.event(200, 30000, &[&["d", "a"]], "")).unwrap()),
+        ]
     };
     let q = Noq::open(dir.path(), small()).unwrap();
-    assert_eq!(state(&q, old_first), State::Dead);
-    assert_eq!(state(&q, old_second), State::Dead);
-    assert_eq!(peek(&q, "{}"), [new_second, new_first]);
+    assert_eq!(peek(&q, "{}"), seqs);
 }
 
 #[test]

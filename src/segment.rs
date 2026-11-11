@@ -57,7 +57,8 @@ pub enum State {
     Leased = 2,
     /// Consumed; the record is garbage.
     Acked = 3,
-    /// Replaced or expired before it was consumed; also garbage.
+    /// Expired before it was consumed, or an original compaction moved;
+    /// also garbage.
     Dead = 4,
 }
 

@@ -258,7 +258,8 @@ impl fmt::Debug for NoteRef<'_> {
     }
 }
 
-/// How NIP-01 says a relay keeps a kind's events.
+/// How NIP-01 says a relay keeps a kind's events. The queue queues every
+/// class alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KindClass {
     /// Every event is kept.
@@ -279,11 +280,6 @@ impl KindClass {
             30000..40000 => KindClass::Addressable,
             _ => KindClass::Regular,
         }
-    }
-
-    /// Whether a newer event replaces older ones of this kind.
-    pub fn replaces(self) -> bool {
-        matches!(self, KindClass::Replaceable | KindClass::Addressable)
     }
 }
 

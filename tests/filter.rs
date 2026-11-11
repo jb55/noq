@@ -52,8 +52,7 @@ fn reference(f: &Value, ev: &Value) -> bool {
     })
 }
 
-/// A queue holding every sample event but the replaced versions, and the
-/// parsed events left in it by seq.
+/// A queue holding every sample event, and the parsed events by seq.
 fn sample_queue(dir: &std::path::Path) -> (Noq, Vec<(Seq, Value)>) {
     let q = Noq::open(dir, small()).unwrap();
     let mut evs: Vec<(Seq, Value)> = Vec::new();
@@ -61,11 +60,6 @@ fn sample_queue(dir: &std::path::Path) -> (Noq, Vec<(Seq, Value)>) {
         let ev = || serde_json::from_slice(e).unwrap();
         match q.push_note(NoteRef::new(index, e).unwrap()).unwrap() {
             Pushed::Queued(seq) => evs.push((seq, ev())),
-            Pushed::Replaced { seq, old } => {
-                evs.retain(|&(s, _)| s != old);
-                evs.push((seq, ev()));
-            }
-            Pushed::Stale(_) => {}
             d => panic!("sample event pushed twice: {d:?}"),
         }
     }

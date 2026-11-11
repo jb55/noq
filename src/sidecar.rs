@@ -10,7 +10,7 @@
 //!   nkeys     u32
 //!   records   [Entry; nrec], in offset order, every state included:
 //!     off         u32
-//!     flags       u32      1: the kind replaces  2: has an expiration tag
+//!     flags       u32      2: has an expiration tag  1: reserved, ignored
 //!     created_at  u64
 //!     expiration  u64      the NIP-40 tag's time, when flag 2
 //!     id          [u8; 32]
@@ -35,14 +35,14 @@ use std::path::{Path, PathBuf};
 
 use crate::error::Error;
 use crate::index::{Key, keys};
-use crate::note::KindClass;
 use crate::segment::{Segment, Seq};
 
 const MAGIC: [u8; 8] = *b"noqidx\0\x01";
 const HEAD_LEN: usize = 24;
 const ENTRY_LEN: usize = 56;
 
-const REPLACES: u32 = 1;
+/// Flag 1 once marked a kind that replaces. It is no longer set, and is
+/// ignored where an older sidecar has it.
 const EXPIRES: u32 = 2;
 
 /// One record of a sealed segment, as its sidecar lists it.
@@ -52,8 +52,6 @@ pub(crate) struct Entry {
     pub created_at: u64,
     /// The NIP-40 `expiration` tag.
     pub expiration: Option<u64>,
-    /// Whether the kind is replaceable or addressable.
-    pub replaces: bool,
     pub id: [u8; 32],
 }
 
@@ -86,7 +84,6 @@ impl Sidecar {
                 off: r.seq().offset(),
                 created_at: note.created_at(),
                 expiration: note.expiration(),
-                replaces: KindClass::of(note.kind()).replaces(),
                 id: *note.id(),
             });
             keys(&note, |k| {
@@ -138,8 +135,7 @@ impl Sidecar {
             out.extend_from_slice(&n.to_le_bytes());
         }
         for e in &self.records {
-            let flags = if e.replaces { REPLACES } else { 0 }
-                | if e.expiration.is_some() { EXPIRES } else { 0 };
+            let flags = if e.expiration.is_some() { EXPIRES } else { 0 };
             out.extend_from_slice(&e.off.to_le_bytes());
             out.extend_from_slice(&flags.to_le_bytes());
             out.extend_from_slice(&e.created_at.to_le_bytes());
@@ -181,7 +177,6 @@ impl Sidecar {
                 off,
                 created_at,
                 expiration: (flags & EXPIRES != 0).then_some(expiration),
-                replaces: flags & REPLACES != 0,
                 id: r.take(32)?.try_into().ok()?,
             });
         }
@@ -284,14 +279,12 @@ mod tests {
                     off: 0,
                     created_at: 1,
                     expiration: None,
-                    replaces: false,
                     id: [1; 32],
                 },
                 Entry {
                     off: 512,
                     created_at: 2,
                     expiration: Some(0),
-                    replaces: true,
                     id: [2; 32],
                 },
             ],
@@ -309,6 +302,19 @@ mod tests {
         assert_eq!(Sidecar::decode(&sc.encode()), Some(sample()));
         assert_eq!(Sidecar::key(&sc.keys[1].0), Some(Key::Kind(1)));
         assert_eq!(Sidecar::key(&sc.keys[2].0), Some(Key::Tag(b'p', b"abc")));
+    }
+
+    #[test]
+    fn ignores_the_old_replaces_flag() {
+        // Written before flag 1 was retired: set on both entries.
+        let mut buf = sample().encode();
+        buf.truncate(buf.len() - 4);
+        for i in 0..2 {
+            buf[HEAD_LEN + i * ENTRY_LEN + 4] |= 1;
+        }
+        let crc = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(Sidecar::decode(&buf), Some(sample()));
     }
 
     #[test]

@@ -144,10 +144,8 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
 ///
 /// ```text
 /// queued <id> <seq>
-/// replaced <id> <seq> <old seq>
 /// duplicate <id> <seq>
 /// seen <id>
-/// stale <id> <newer seq>
 /// expired <id>
 /// invalid <line number> <why>
 /// ```
@@ -179,12 +177,8 @@ fn push(q: &Noq) -> Result<ExitCode, String> {
                 }
                 match p {
                     Pushed::Queued(s) => format!("queued {id} {}", seq(s)),
-                    Pushed::Replaced { seq: s, old } => {
-                        format!("replaced {id} {} {}", seq(s), seq(old))
-                    }
                     Pushed::Duplicate(s) => format!("duplicate {id} {}", seq(s)),
                     Pushed::Seen => format!("seen {id}"),
-                    Pushed::Stale(s) => format!("stale {id} {}", seq(s)),
                     Pushed::Expired => format!("expired {id}"),
                 }
             }

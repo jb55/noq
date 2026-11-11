@@ -65,13 +65,13 @@ fn push_reports_each_line() {
     let words: Vec<Vec<&str>> = out.iter().map(|l| l.split(' ').collect()).collect();
     assert_eq!(words.len(), 5, "{out:?}");
     assert_eq!(words[0][..2], ["queued", &id(&v1)]);
-    assert_eq!(words[1][..2], ["replaced", &id(&v2)]);
-    assert_eq!(words[1][3], words[0][2], "v2 replaced v1's seq");
+    // Every version of a replaceable event is queued.
+    assert_eq!(words[1][..2], ["queued", &id(&v2)]);
     assert_eq!(words[2][..3], ["duplicate", &id(&v2), words[1][2]]);
     // Line numbers count the blank line.
     assert_eq!(words[3][..2], ["invalid", "5"]);
-    assert_eq!(words[4][..3], ["stale", &id(&old), words[1][2]]);
-    assert!(String::from_utf8_lossy(&o.stderr).contains("2 queued, 2 not queued, 1 invalid"));
+    assert_eq!(words[4][..2], ["queued", &id(&old)]);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("3 queued, 1 not queued, 1 invalid"));
 }
 
 #[test]
