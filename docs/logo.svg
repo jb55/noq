@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="noq">
 <title>noq</title>
-<rect width="128" height="128" rx="28" fill="#16121d"/>
-<g transform="translate(7.00 -3.00)">
-<g fill="none" stroke-width="15"><path d="M76.92 40.29A26 26 0 0 1 76.92 73.71M37.08 73.71A26 26 0 0 1 37.08 40.29M40.29 37.08A26 26 0 0 1 73.71 37.08" stroke="#ece6f7"/><path d="M73.71 82.92A26 26 0 0 1 40.29 82.92" stroke="#f5a524"/></g>
-<path d="M75.50 23.50h15v79.50a7.5 7.5 0 0 1 -15 0z" fill="#ece6f7"/>
+<rect width="128" height="128" rx="28" fill="#f5a524"/>
+<g fill="#16121d">
+<path d="M64 22a31 31 0 1 0 0 62a31 31 0 1 0 0-62zm0 16.5a14.5 14.5 0 1 1 0 29a14.5 14.5 0 1 1 0-29z"/>
+<path d="M78 22h17v75.5a8.5 8.5 0 0 1 -17 0z"/>
 </g>
 </svg>
