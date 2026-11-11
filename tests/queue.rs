@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use noq::{Config, Error, Fsync, Lease, Log, Noq, Pushed, Segment, Seq, State};
+use noq::{Config, Error, Fsync, KindClass, Lease, Log, Noq, NoteRef, Pushed, Segment, Seq, State};
 
 fn events() -> Vec<Vec<u8>> {
     std::fs::read("tests/data/many-events-sample.jsonl")
@@ -14,7 +14,12 @@ fn events() -> Vec<Vec<u8>> {
         .split(|&c| c == b'\n')
         .filter(|l| !l.is_empty())
         .map(<[u8]>::to_vec)
-        .filter(|l| noq::build_note(l).is_ok())
+        // Every event queued for good: these tests are about leases, not
+        // about versions replacing each other.
+        .filter(|l| {
+            noq::build_note(l)
+                .is_ok_and(|idx| !KindClass::of(NoteRef::new(&idx, l).unwrap().kind()).replaces())
+        })
         .collect()
 }
 
@@ -30,6 +35,7 @@ fn small() -> Config {
     Config {
         segment_size: 64 << 10,
         fsync: Fsync::Never,
+        ..Config::default()
     }
 }
 

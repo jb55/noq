@@ -21,6 +21,7 @@ fn small(fsync: Fsync) -> Config {
     Config {
         segment_size: 64 << 10,
         fsync,
+        ..Config::default()
     }
 }
 
@@ -94,6 +95,7 @@ fn rejects_invalid_and_oversized() {
         Config {
             segment_size: 4096,
             fsync: Fsync::Never,
+            ..Config::default()
         },
     )
     .unwrap();

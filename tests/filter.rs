@@ -17,6 +17,7 @@ fn small() -> Config {
     Config {
         segment_size: 64 << 10,
         fsync: Fsync::Never,
+        ..Config::default()
     }
 }
 
@@ -51,18 +52,23 @@ fn reference(f: &Value, ev: &Value) -> bool {
     })
 }
 
-/// A queue holding every sample event, and the parsed events by seq.
+/// A queue holding every sample event but the replaced versions, and the
+/// parsed events left in it by seq.
 fn sample_queue(dir: &std::path::Path) -> (Noq, Vec<(Seq, Value)>) {
     let q = Noq::open(dir, small()).unwrap();
-    let evs = common::sample()
-        .iter()
-        .map(
-            |(e, index)| match q.push_note(NoteRef::new(index, e).unwrap()).unwrap() {
-                Pushed::Queued(seq) => (seq, serde_json::from_slice(e).unwrap()),
-                d => panic!("sample event pushed twice: {d:?}"),
-            },
-        )
-        .collect();
+    let mut evs: Vec<(Seq, Value)> = Vec::new();
+    for (e, index) in common::sample() {
+        let ev = || serde_json::from_slice(e).unwrap();
+        match q.push_note(NoteRef::new(index, e).unwrap()).unwrap() {
+            Pushed::Queued(seq) => evs.push((seq, ev())),
+            Pushed::Replaced { seq, old } => {
+                evs.retain(|&(s, _)| s != old);
+                evs.push((seq, ev()));
+            }
+            Pushed::Stale(_) => {}
+            d => panic!("sample event pushed twice: {d:?}"),
+        }
+    }
     (q, evs)
 }
 
@@ -274,7 +280,7 @@ fn push_drops_duplicates_even_once_consumed_and_after_reopen() {
     q.lease_seq(seq, LONG).unwrap().ack().unwrap();
     // Consumed but still in the log: a relay re-sending it is ignored.
     assert_eq!(q.push(&evs[0]).unwrap(), Pushed::Duplicate(seq));
-    assert!(q.push(&evs[1]).unwrap().seq() > seq);
+    assert!(q.push(&evs[1]).unwrap().queued().unwrap() > seq);
     drop(q);
 
     let q = Noq::open(dir.path(), small()).unwrap();
@@ -357,7 +363,7 @@ fn tag_edge_cases() {
     let dir = tempfile::tempdir().unwrap();
     let q = Noq::open(dir.path(), small()).unwrap();
     let s = Signer::new(7);
-    let push = |ev: Vec<u8>| q.push(&ev).unwrap().seq();
+    let push = |ev: Vec<u8>| q.push(&ev).unwrap().queued().unwrap();
     // The same value twice in one event is one candidate, not two.
     let twice = push(s.event(1, 1, &[&["p", "x"], &["p", "x"], &["p", "y"]], ""));
     // Only a tag's first value after its name is indexed.
@@ -456,7 +462,7 @@ fn concurrent_pushers_and_consumers_take_each_item_once() {
     std::thread::scope(|s| {
         s.spawn(|| {
             for (i, ev) in evs.iter().enumerate() {
-                let seq = q.push(ev).unwrap().seq();
+                let seq = q.push(ev).unwrap().queued().unwrap();
                 if i % 5 % 2 == 0 {
                     pushed.lock().insert(seq);
                 }

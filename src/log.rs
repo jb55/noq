@@ -42,6 +42,14 @@ pub struct Config {
     /// Size of each new segment file. A record must fit in one segment.
     pub segment_size: u32,
     pub fsync: Fsync,
+    /// [`Noq`](crate::Noq) only: an event is expired once its
+    /// `created_at` is this far in the past, as if it had a NIP-40
+    /// `expiration` tag. `None` keeps events until their own tag says.
+    pub max_age: Option<Duration>,
+    /// [`Noq`](crate::Noq) only: how many ids of consumed events to
+    /// remember after their records leave the log, so a relay re-sending
+    /// one doesn't queue it again. In memory: forgotten on reopen.
+    pub seen_ids: usize,
 }
 
 impl Default for Config {
@@ -49,6 +57,8 @@ impl Default for Config {
         Config {
             segment_size: 64 << 20,
             fsync: Fsync::Every(Duration::from_millis(100)),
+            max_age: None,
+            seen_ids: 1 << 16,
         }
     }
 }

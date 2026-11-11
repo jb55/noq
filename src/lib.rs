@@ -7,6 +7,7 @@
 
 mod builder;
 mod error;
+mod expire;
 mod filter;
 mod index;
 mod json;
@@ -22,7 +23,7 @@ pub use error::Error;
 pub use filter::{Filter, TagClause};
 pub use index::Plan;
 pub use log::{Config, Fsync, Log, Record, Scan};
-pub use note::{HEAD_LEN, NoteRef, Span, Tag, TagValues, Tags};
+pub use note::{HEAD_LEN, KindClass, NoteRef, Span, Tag, TagValues, Tags};
 pub use queue::{IndexStats, Lease, Noq, Pushed};
 pub use segment::{RECORD_HEADER_LEN, RECORD_VERSION, RecordRef, Records, Segment, Seq, State};
 pub use verify::{canonical, compute_id, verify_sig};

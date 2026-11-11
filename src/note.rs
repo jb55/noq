@@ -208,6 +208,30 @@ impl<'a> NoteRef<'a> {
         Tags { note: *self, i: 0 }
     }
 
+    /// The first value of the first tag named `name`, if there is one.
+    pub fn tag_value(&self, name: &[u8]) -> Option<&'a [u8]> {
+        self.tags().find(|t| t.get(0) == Some(name))?.get(1)
+    }
+
+    /// The NIP-40 `expiration` tag's unix time. A malformed value counts
+    /// as none.
+    pub fn expiration(&self) -> Option<u64> {
+        let v = self.tag_value(b"expiration")?;
+        if v.is_empty() || v.len() > 20 || !v.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(v).ok()?.parse().ok()
+    }
+
+    /// The `d` tag's value, which names an addressable event within its
+    /// author and kind. Missing, or a `d` tag with no value, is empty.
+    pub fn d_tag(&self) -> &'a [u8] {
+        match self.tags().find(|t| t.get(0) == Some(b"d")) {
+            Some(t) => t.get(1).unwrap_or_default(),
+            None => b"",
+        }
+    }
+
     fn tag_start(&self, i: usize) -> usize {
         le_u16(&self.index[HEAD_LEN + i * 2..]) as usize
     }
@@ -231,6 +255,35 @@ impl fmt::Debug for NoteRef<'_> {
             .field("kind", &self.kind())
             .field("ntags", &self.ntags)
             .finish()
+    }
+}
+
+/// How NIP-01 says a relay keeps a kind's events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KindClass {
+    /// Every event is kept.
+    Regular,
+    /// 0, 3 and 10000–19999: only the newest event per author and kind.
+    Replaceable,
+    /// 20000–29999: not stored by relays. A queue still queues them.
+    Ephemeral,
+    /// 30000–39999: only the newest event per author, kind and `d` tag.
+    Addressable,
+}
+
+impl KindClass {
+    pub fn of(kind: u32) -> KindClass {
+        match kind {
+            0 | 3 | 10000..20000 => KindClass::Replaceable,
+            20000..30000 => KindClass::Ephemeral,
+            30000..40000 => KindClass::Addressable,
+            _ => KindClass::Regular,
+        }
+    }
+
+    /// Whether a newer event replaces older ones of this kind.
+    pub fn replaces(self) -> bool {
+        matches!(self, KindClass::Replaceable | KindClass::Addressable)
     }
 }
 

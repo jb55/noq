@@ -11,6 +11,19 @@
 //! ACKED, `nack` puts it back now, and a lease that runs out (or is dropped
 //! without either) is put back by the reaper thread at its deadline, so an
 //! item is delivered at least once.
+//!
+//! Some items die without being consumed, moving to DEAD:
+//!
+//! - A replaceable or addressable event is replaced by a newer version of
+//!   it: pushing the newer one kills the older if nobody holds it. A held
+//!   one is left to its holder, and is killed by the first walk past it if
+//!   it comes back. An older version pushed after a newer one is dropped.
+//! - An event expires at its NIP-40 `expiration` tag, or once it is
+//!   [`Config::max_age`] old. Walks never hand out an expired item, and a
+//!   sweep run by pushes and leases kills the rest so their segments drop.
+//!
+//! Every id stays known while its record is in the log, and a bounded seen
+//! ring remembers it after, so pushing a consumed event again is a no-op.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -23,11 +36,12 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::builder::NoteBuilder;
 use crate::error::Error;
+use crate::expire::{self, Expiry};
 use crate::filter::Filter;
 use crate::index::{Index, Plan};
 use crate::lease::Leases;
 use crate::log::{Config, Log, Record};
-use crate::note::NoteRef;
+use crate::note::{KindClass, NoteRef};
 use crate::segment::{Seq, State};
 
 /// Candidates read from the index per lock: a walk holds the index's read
@@ -46,15 +60,28 @@ thread_local! {
 pub enum Pushed {
     /// Queued at this seq.
     Queued(Seq),
+    /// Queued at `seq`, and the older version of this replaceable or
+    /// addressable event at `old`, which nobody held, is now DEAD.
+    Replaced { seq: Seq, old: Seq },
     /// An event with this id is already in the log, at this seq, queued or
     /// consumed; nothing was added.
     Duplicate(Seq),
+    /// An event with this id was consumed and its record has left the log,
+    /// but the seen ring remembers it; nothing was added.
+    Seen,
+    /// A newer version of this replaceable or addressable event is in the
+    /// log at this seq, queued or consumed; nothing was added.
+    Stale(Seq),
+    /// The event is already expired; nothing was added.
+    Expired,
 }
 
 impl Pushed {
-    pub fn seq(self) -> Seq {
+    /// Where the event was queued, if it was.
+    pub fn queued(self) -> Option<Seq> {
         match self {
-            Pushed::Queued(s) | Pushed::Duplicate(s) => s,
+            Pushed::Queued(seq) | Pushed::Replaced { seq, .. } => Some(seq),
+            _ => None,
         }
     }
 }
@@ -66,6 +93,10 @@ pub struct IndexStats {
     pub ids: usize,
     /// Entries across every posting list.
     pub postings: usize,
+    /// Ids remembered in the seen ring after their records left the log.
+    pub seen: usize,
+    /// Records waiting for their expiry sweep.
+    pub expiring: usize,
 }
 
 /// A queue over a [`Log`] directory. Cloning it is cheap; clones share the
@@ -81,6 +112,7 @@ struct Inner {
     push_lock: Mutex<()>,
     /// [`Log::dropped`] when the index was last trimmed.
     trimmed: AtomicU64,
+    expiry: Expiry,
     leases: Arc<Leases>,
     reaper: Option<JoinHandle<()>>,
 }
@@ -96,26 +128,43 @@ impl Drop for Inner {
 
 impl Noq {
     /// Opens the queue in `dir` and indexes every record in it. Items
-    /// leased when the last process exited are queued again.
+    /// leased when the last process exited are queued again; expired ones
+    /// and replaced versions die.
     pub fn open(dir: impl AsRef<Path>, config: Config) -> Result<Noq, Error> {
         let log = Log::open(dir, config)?;
-        let mut index = Index::default();
+        let trimmed = AtomicU64::new(log.dropped());
+        let mut index = Index::new(config.seen_ids);
+        let expiry = Expiry::new(config.max_age);
         for rec in log.scan(Seq(0)) {
             let r = rec.get();
-            let pending = matches!(r.state(), State::Live | State::Leased);
-            index.insert(&r.note(), rec.seq(), pending);
+            let note = r.note();
+            // Recovery made every pending record LIVE.
+            let pending = r.state() == State::Live;
+            // A replaced version still LIVE: its replacement's push died
+            // before killing it, or it was leased then and came back.
+            if let Some(old) = index
+                .insert(&note, rec.seq(), pending)
+                .and_then(|s| log.get(s))
+            {
+                log.retire(&old, State::Live, State::Dead);
+            }
+            if let (true, Some(at)) = (pending, expiry.of(&note)) {
+                expiry.add(at, rec.seq());
+            }
         }
-        let trimmed = AtomicU64::new(log.dropped());
         let leases = Leases::new();
         let reaper = Some(leases.spawn_reaper()?);
-        Ok(Noq(Arc::new(Inner {
+        let q = Noq(Arc::new(Inner {
             log,
             index: RwLock::new(index),
             push_lock: Mutex::new(()),
             trimmed,
+            expiry,
             leases,
             reaper,
-        })))
+        }));
+        q.expire();
+        Ok(q)
     }
 
     /// The log under the queue. Appending to it directly bypasses the
@@ -125,8 +174,8 @@ impl Noq {
         &self.0.log
     }
 
-    /// Parses, verifies and queues one event, unless an event with its id
-    /// is already in the log.
+    /// Parses, verifies and queues one event, unless it is a duplicate,
+    /// expired, or older than a version of it already in the log.
     pub fn push(&self, json: &[u8]) -> Result<Pushed, Error> {
         SCRATCH.with_borrow_mut(|(builder, index)| {
             index.clear();
@@ -139,18 +188,52 @@ impl Noq {
     /// signature checked, by the caller.
     pub fn push_note(&self, note: NoteRef<'_>) -> Result<Pushed, Error> {
         let inner = &self.0;
+        let now = expire::now();
         let pushed = {
             let _push = inner.push_lock.lock();
-            if let Some(seq) = inner.index.read().id(note.id()) {
+            let index = inner.index.read();
+            if let Some(seq) = index.id(note.id()) {
                 return Ok(Pushed::Duplicate(seq));
             }
+            if index.seen(note.id()) {
+                return Ok(Pushed::Seen);
+            }
+            let expires = inner.expiry.of(&note);
+            if expires.is_some_and(|at| at <= now) {
+                return Ok(Pushed::Expired);
+            }
+            if let Some(seq) = index.newer(&note) {
+                return Ok(Pushed::Stale(seq));
+            }
+            drop(index);
             let seq = inner.log.append_note(note)?;
-            inner.index.write().insert(&note, seq, true);
-            Pushed::Queued(seq)
+            let lost = inner.index.write().insert(&note, seq, true);
+            if let Some(at) = expires {
+                inner.expiry.add(at, seq);
+            }
+            // `newer` said nothing beats this one, so what lost is older.
+            match lost.and_then(|old| Some((old, inner.log.get(old)?))) {
+                Some((old, rec)) if inner.log.retire(&rec, State::Live, State::Dead) => {
+                    Pushed::Replaced { seq, old }
+                }
+                _ => Pushed::Queued(seq),
+            }
         };
-        // The append may have sealed a drained tail and dropped it.
+        if inner.expiry.is_due(now) {
+            inner.expiry.sweep(&inner.log, now);
+        }
+        // The append may have sealed a drained tail and dropped it, and the
+        // kills may have drained others.
         self.trim();
         Ok(pushed)
+    }
+
+    /// Kills every queued item whose expiry has passed, now rather than
+    /// when a push or lease next gets to it. Returns how many.
+    pub fn expire(&self) -> usize {
+        let killed = self.0.expiry.sweep(&self.0.log, expire::now());
+        self.trim();
+        killed
     }
 
     /// Leases up to `limit` queued items matching `filter`, oldest first,
@@ -194,18 +277,30 @@ impl Noq {
         IndexStats {
             ids: index.len(),
             postings: index.postings(),
+            seen: index.seen_len(),
+            expiring: self.0.expiry.len(),
         }
     }
 
     /// Calls `visit` with each LIVE record matching `filter` that was in the
     /// log when the walk started, in seq order, until it returns false.
-    fn walk(&self, filter: &Filter, mut visit: impl FnMut(Record) -> bool) {
+    /// Expired and replaced records it finds on the way die instead.
+    fn walk(&self, filter: &Filter, visit: impl FnMut(Record) -> bool) {
+        let now = expire::now();
+        if self.0.expiry.is_due(now) {
+            self.0.expiry.sweep(&self.0.log, now);
+        }
+        self.walk_at(filter, now, visit);
+        self.trim();
+    }
+
+    fn walk_at(&self, filter: &Filter, now: u64, mut visit: impl FnMut(Record) -> bool) {
         let inner = &self.0;
         let end = inner.log.tail_seq();
         let plan = inner.index.read().plan(filter);
         match plan {
             Plan::Empty => {}
-            Plan::Scan => self.scan_live(end, |n| filter.matches(&n), visit),
+            Plan::Scan => self.scan_live(end, now, |n| filter.matches(&n), visit),
             _ => {
                 let mut batch = Vec::with_capacity(BATCH);
                 let mut from = Seq(0);
@@ -218,7 +313,9 @@ impl Noq {
                             continue;
                         };
                         let r = rec.get();
-                        let hit = r.state() == State::Live && filter.matches(&r.note());
+                        let hit = r.state() == State::Live
+                            && filter.matches(&r.note())
+                            && !self.kill_if_dead(&rec, now);
                         if hit && !visit(rec) {
                             return;
                         }
@@ -236,6 +333,7 @@ impl Noq {
     fn scan_live(
         &self,
         end: Seq,
+        now: u64,
         mut pred: impl FnMut(NoteRef<'_>) -> bool,
         mut visit: impl FnMut(Record) -> bool,
     ) {
@@ -244,10 +342,26 @@ impl Noq {
                 return;
             }
             let r = rec.get();
-            if r.state() == State::Live && pred(r.note()) && !visit(rec) {
+            let hit = r.state() == State::Live && pred(r.note()) && !self.kill_if_dead(&rec, now);
+            if hit && !visit(rec) {
                 return;
             }
         }
+    }
+
+    /// Whether a LIVE record is expired at `now` or replaced by a newer
+    /// version, killing it if so. Pushes and sweeps kill most such records
+    /// first; this catches the ones they couldn't because they were held,
+    /// and expiries the sweep hasn't reached.
+    fn kill_if_dead(&self, rec: &Record, now: u64) -> bool {
+        let inner = &self.0;
+        let note = rec.note();
+        let dead = inner.expiry.expired(&note, now)
+            || (KindClass::of(note.kind()).replaces() && inner.index.read().newer(&note).is_some());
+        if dead {
+            inner.log.retire(rec, State::Live, State::Dead);
+        }
+        dead
     }
 
     /// Leases up to `limit` queued items that `pred` accepts, oldest first,
@@ -264,12 +378,13 @@ impl Noq {
         let end = self.0.log.tail_seq();
         let mut taken = Vec::new();
         if limit > 0 {
-            self.scan_live(end, pred, |rec| {
+            self.scan_live(end, expire::now(), pred, |rec| {
                 if rec.get().cas_state(State::Live, State::Leased) {
                     taken.push(rec);
                 }
                 taken.len() < limit
             });
+            self.trim();
         }
         self.hold(taken, ttl)
     }
@@ -292,9 +407,14 @@ impl Noq {
         }
     }
 
-    /// Leases the item at `seq` for `ttl`, if it is still queued.
+    /// Leases the item at `seq` for `ttl`, if it is still queued and
+    /// neither expired nor replaced.
     pub fn lease_seq(&self, seq: Seq, ttl: Duration) -> Option<Lease> {
         let rec = self.0.log.get(seq)?;
+        if rec.state() != State::Live || self.kill_if_dead(&rec, expire::now()) {
+            self.trim();
+            return None;
+        }
         if !rec.get().cas_state(State::Live, State::Leased) {
             return None;
         }
