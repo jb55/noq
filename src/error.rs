@@ -1,7 +1,9 @@
 use std::fmt;
+use std::io;
+use std::sync::Arc;
 
-/// Why an event was rejected.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Why an event was rejected, or a log operation failed.
+#[derive(Debug, Clone)]
 pub enum Error {
     /// Malformed JSON or a field of the wrong shape, at byte `at`.
     Json { at: usize, what: &'static str },
@@ -21,6 +23,37 @@ pub enum Error {
     BadSig,
     /// A span index too short for the sizes in its own head.
     BadIndex,
+    /// A filesystem call failed.
+    Io(Arc<io::Error>),
+    /// Another process has the log open.
+    Locked,
+    /// A config value out of range.
+    Config(&'static str),
+    /// A segment file that can't be opened as one.
+    Corrupt(&'static str),
+}
+
+impl PartialEq for Error {
+    fn eq(&self, other: &Error) -> bool {
+        use Error::*;
+        match (self, other) {
+            (Json { at: a, what: w }, Json { at: b, what: v }) => a == b && w == v,
+            (Missing(a), Missing(b))
+            | (Duplicate(a), Duplicate(b))
+            | (TooLarge(a), TooLarge(b)) => a == b,
+            (Config(a), Config(b)) | (Corrupt(a), Corrupt(b)) => a == b,
+            (Io(a), Io(b)) => a.kind() == b.kind(),
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
+}
+
+impl Eq for Error {}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Error {
+        Error::Io(Arc::new(e))
+    }
 }
 
 impl fmt::Display for Error {
@@ -35,8 +68,19 @@ impl fmt::Display for Error {
             Error::BadId => write!(f, "id does not match the event hash"),
             Error::BadSig => write!(f, "signature does not verify"),
             Error::BadIndex => write!(f, "corrupt note index"),
+            Error::Io(e) => write!(f, "io: {e}"),
+            Error::Locked => write!(f, "the log is open in another process"),
+            Error::Config(what) => write!(f, "bad config: {what}"),
+            Error::Corrupt(what) => write!(f, "corrupt segment: {what}"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(&**e),
+            _ => None,
+        }
+    }
+}
