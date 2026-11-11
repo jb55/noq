@@ -9,7 +9,10 @@
 //! There is no waiting lease here: the queue directory is locked to the
 //! process that has it open, so nothing could push while one waited.
 
+mod bench;
+
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -29,6 +32,8 @@ commands:
   compact              move queued events off mostly-consumed segments so
                        those can be dropped; prints how many moved
   stats                print the queue's size
+  bench [FILE]         time pushing FILE's events into a fresh queue and
+                       leasing them all back; see bench --help
 
 FILTER is one NIP-01 filter object, e.g. '{\"kinds\":[1]}'; the default,
 '{}', matches everything.
@@ -60,7 +65,7 @@ fn main() -> ExitCode {
 
 fn run(args: Vec<String>) -> Result<ExitCode, String> {
     let mut args = Args(args.into_iter());
-    let mut dir = std::env::var_os("NOQ_DIR").unwrap_or_else(|| "noq".into());
+    let mut dir: Option<PathBuf> = None;
     let mut config = Config::default();
     let cmd = loop {
         let Some(arg) = args.next() else {
@@ -71,7 +76,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
                 print!("{USAGE}");
                 return Ok(ExitCode::SUCCESS);
             }
-            "-d" | "--dir" => dir = args.value(&arg)?.into(),
+            "-d" | "--dir" => dir = Some(args.value(&arg)?.into()),
             "--segment-size" => {
                 let v = args.value(&arg)?;
                 config.segment_size = parse_size(&v).ok_or(format!("bad {arg}: {v}"))?;
@@ -95,6 +100,17 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             _ => break arg,
         }
     };
+    if cmd == "bench" {
+        if args.0.as_slice().iter().any(|a| a == "-h" || a == "--help") {
+            print!("{}", bench::USAGE);
+            return Ok(ExitCode::SUCCESS);
+        }
+        let opts = bench::BenchOpts::parse(&mut args)?;
+        return bench::bench(dir, config, &opts);
+    }
+    let dir = dir
+        .or_else(|| std::env::var_os("NOQ_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| "noq".into());
     let open = || Noq::open(&dir, config).map_err(|e| format!("{}: {e}", dir.display()));
     match cmd.as_str() {
         "push" => {
@@ -386,6 +402,14 @@ impl Args {
 
     fn num<T: std::str::FromStr>(&self, flag: &str, v: &str) -> Result<T, String> {
         v.parse().map_err(|_| format!("bad {flag}: {v}"))
+    }
+
+    fn positive(&mut self, flag: &str) -> Result<usize, String> {
+        let v = self.value(flag)?;
+        match self.num(flag, &v)? {
+            0 => Err(format!("bad {flag}: {v}")),
+            n => Ok(n),
+        }
     }
 
     fn secs(&mut self, flag: &str) -> Result<Duration, String> {

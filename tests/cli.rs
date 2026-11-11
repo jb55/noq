@@ -172,3 +172,63 @@ fn compact_moves_what_is_left_on_consumed_segments() {
     want.sort();
     assert_eq!(got, want);
 }
+
+#[test]
+fn bench_pushes_and_drains_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Signer::new(1);
+    let mut input = Vec::new();
+    for i in 0..60 {
+        let ev = s.event(i, if i % 3 == 0 { 2 } else { 1 }, &[], "");
+        // Bare events and relay messages both go in.
+        if i % 2 == 0 {
+            input.extend_from_slice(&ev);
+        } else {
+            input.extend_from_slice(b"[\"EVENT\",\"sub\",");
+            input.extend_from_slice(&ev);
+            input.push(b']');
+        }
+        input.push(b'\n');
+    }
+    input.extend_from_slice(b"{\"nope\":1}\n");
+    let file = dir.path().join("events.jsonl");
+    std::fs::write(&file, &input).unwrap();
+    let q = dir.path().join("q");
+    let bench = |extra: &[&str]| {
+        let mut args = vec!["--segment-size", "4k", "bench", file.to_str().unwrap()];
+        args.extend_from_slice(&["--threads", "3", "--consumers", "2", "--batch", "7"]);
+        args.extend_from_slice(extra);
+        noq(&q, &args, b"")
+    };
+    let field = |out: &[String], prefix: &str| -> String {
+        out.iter()
+            .find_map(|l| l.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} in {out:?}"))
+            .trim()
+            .to_owned()
+    };
+
+    let o = bench(&[]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = lines(&o);
+    assert!(field(&out, "input").starts_with("61 events"), "{out:?}");
+    assert!(
+        out.contains(&"         60 queued, 0 not queued, 1 invalid".into()),
+        "{out:?}"
+    );
+    assert!(field(&out, "lease").starts_with("60 acked"), "{out:?}");
+    assert!(field(&out, "drained").ends_with("; 0 pending"), "{out:?}");
+    assert!(!q.exists(), "the queue is removed after");
+
+    // A filter leases only what it matches; --keep leaves the queue.
+    let o = bench(&["--filter", r#"{"kinds":[2]}"#, "--keep"]);
+    assert!(o.status.success());
+    let out = lines(&o);
+    assert!(field(&out, "lease").starts_with("20 acked"), "{out:?}");
+    assert!(field(&out, "drained").ends_with("; 40 pending"), "{out:?}");
+    assert_eq!(stat(&q, "pending"), 40);
+
+    // Not on a queue that has things in it.
+    assert_eq!(bench(&[]).status.code(), Some(2));
+    assert_eq!(stat(&q, "pending"), 40);
+}
