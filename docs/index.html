@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>noq — a nostr message-queue store</title>
+<meta name="description" content="noq is a nostr message-queue store in pure Rust: push signed events, lease them by NIP-01 filter, ack to consume. Consumed segments are deleted, so the disk drains with the queue.">
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<meta property="og:title" content="noq — a nostr message-queue store">
+<meta property="og:description" content="Push signed nostr events, lease them by filter, ack to consume. Pure Rust.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #fbfaf7;
+  --panel: #f2efe8;
+  --ink: #1b1722;
+  --muted: #5d5868;
+  --line: #ddd8cf;
+  --accent: #c7790a;
+  --accent-soft: #f5a52433;
+  --term: #16121d;
+  --term-ink: #ece6f7;
+  --term-dim: #9d95ad;
+  --live: #ece6f7;
+  --live-edge: #8f86a3;
+  --leased: #f5a524;
+  --acked: #cfc9d8;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #110e16;
+    --panel: #1b1722;
+    --ink: #ece6f7;
+    --muted: #a49db3;
+    --line: #2e2838;
+    --accent: #f5a524;
+    --accent-soft: #f5a52422;
+    --term: #0b0910;
+    --live: #3a3347;
+    --live-edge: #8f86a3;
+    --acked: #26212e;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #110e16;
+  --panel: #1b1722;
+  --ink: #ece6f7;
+  --muted: #a49db3;
+  --line: #2e2838;
+  --accent: #f5a524;
+  --accent-soft: #f5a52422;
+  --term: #0b0910;
+  --live: #3a3347;
+  --live-edge: #8f86a3;
+  --acked: #26212e;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 17px/1.6 var(--sans);
+}
+a { color: var(--accent); text-underline-offset: 3px; }
+code, pre, .mono { font-family: var(--mono); }
+code { font-size: 0.9em; background: var(--panel); padding: 0.1em 0.35em; border-radius: 4px; }
+.wrap { max-width: 920px; margin: 0 auto; padding: 0 16px; }
+
+header.top { border-bottom: 1px solid var(--line); }
+header.top .wrap { display: flex; align-items: center; gap: 12px; height: 60px; }
+header.top img { width: 30px; height: 30px; }
+img.tile { border-radius: 22%; box-shadow: 0 0 0 1px var(--line); }
+header.top .name { font: 600 20px var(--mono); letter-spacing: -0.02em; }
+header.top nav { margin-left: auto; display: flex; gap: 20px; font-size: 15px; }
+header.top nav a { color: var(--muted); text-decoration: none; }
+header.top nav a:hover { color: var(--ink); }
+
+.hero { padding-top: 72px; padding-bottom: 48px; display: grid; grid-template-columns: 1fr auto; gap: 40px; align-items: center; }
+.hero h1 { font: 600 clamp(34px, 6vw, 52px)/1.1 var(--sans); letter-spacing: -0.03em; margin: 0 0 18px; }
+.hero h1 em { font-style: normal; color: var(--accent); }
+.hero p.lede { font-size: 19px; color: var(--muted); margin: 0 0 28px; max-width: 36em; }
+.hero .mark { width: 168px; height: 168px; }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 18px; border-radius: 8px; font: 500 15px var(--sans); text-decoration: none; border: 1px solid var(--line); color: var(--ink); background: var(--panel); }
+.btn.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.install { margin-top: 22px; font: 14px var(--mono); color: var(--muted); }
+.install code { color: var(--ink); }
+
+section { padding: 44px 0; border-top: 1px solid var(--line); }
+section h2 { font: 600 26px/1.25 var(--sans); letter-spacing: -0.02em; margin: 0 0 10px; }
+section > .wrap > p.sub { color: var(--muted); margin: 0 0 26px; max-width: 40em; }
+
+.term { background: var(--term); color: var(--term-ink); border-radius: 12px; padding: 18px 20px; overflow-x: auto; font: 13.5px/1.65 var(--mono); }
+.term .p { color: var(--leased); }
+.term .c { color: var(--term-dim); }
+.term .ok { color: #9be39b; }
+.term .no { color: #ff9b8f; }
+pre { margin: 0; }
+
+figure { margin: 0; }
+.diagram { background: var(--panel); border-radius: 12px; padding: 18px 10px 8px; }
+.diagram svg { width: 100%; height: auto; display: block; }
+.diagram text { font-family: var(--mono); fill: var(--ink); }
+.diagram .dim { fill: var(--muted); }
+.diagram .live { fill: var(--live); stroke: var(--live-edge); }
+.diagram .leased { fill: var(--leased); stroke: var(--leased); }
+.diagram .acked { fill: var(--acked); stroke: var(--line); }
+.diagram .seg { fill: none; stroke: var(--live-edge); }
+.diagram .gone { fill: none; stroke: var(--muted); stroke-dasharray: 5 5; }
+.diagram .arrow { stroke: var(--ink); fill: none; stroke-width: 1.6; }
+.diagram .arrow-hot { stroke: var(--accent); fill: none; stroke-width: 1.8; }
+.legend { display: flex; flex-wrap: wrap; gap: 18px; padding: 10px 12px 4px; font: 13px var(--mono); color: var(--muted); }
+.legend span::before { content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 7px; vertical-align: -1px; background: var(--sw); border: 1px solid var(--swe, var(--sw)); }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
+.card { background: var(--panel); border-radius: 12px; padding: 18px 20px; }
+.card h3 { font: 600 16px var(--sans); margin: 0 0 6px; }
+.card p { margin: 0; color: var(--muted); font-size: 15px; }
+
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 18px; }
+.stat { border-left: 3px solid var(--accent); padding: 4px 0 4px 16px; }
+.stat b { display: block; font: 600 30px/1.2 var(--mono); letter-spacing: -0.03em; }
+.stat span { color: var(--muted); font-size: 14px; }
+.note { font-size: 14px; color: var(--muted); }
+
+.code { background: var(--term); color: var(--term-ink); border-radius: 12px; padding: 18px 20px; overflow-x: auto; font: 13.5px/1.65 var(--mono); }
+.code .k { color: #c9a7ff; }
+.code .s { color: #9be39b; }
+.code .c { color: var(--term-dim); }
+.code .t { color: var(--leased); }
+
+.status ul { margin: 0; padding-left: 1.2em; color: var(--muted); }
+.status li { margin: 4px 0; }
+footer { border-top: 1px solid var(--line); padding: 28px 0 48px; font-size: 14px; color: var(--muted); }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; }
+footer img { width: 22px; height: 22px; vertical-align: -5px; margin-right: 8px; }
+
+@media (max-width: 680px) {
+  .hero { grid-template-columns: 1fr; padding-top: 44px; }
+  .hero .mark { width: 96px; height: 96px; order: -1; }
+  header.top nav { gap: 14px; }
+  header.top nav .wide { display: none; }
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <img class="tile" src="logo.svg" alt="">
+    <span class="name">noq</span>
+    <nav>
+      <a href="#how">How it works</a>
+      <a class="wide" href="#numbers">Numbers</a>
+      <a href="https://github.com/jb55/noq">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<div class="wrap hero">
+  <div>
+    <h1>A nostr message queue that <em>forgets</em> what you've consumed.</h1>
+    <p class="lede">noq stores signed nostr events in an append-only log. Consumers lease the events that match a NIP-01 filter and ack them when they're done. When every event in a segment file is consumed, the file is deleted, so the disk drains with the queue.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/jb55/noq">View on GitHub</a>
+      <a class="btn" href="https://github.com/jb55/noq/blob/master/bench/README.md">Benchmarks</a>
+    </div>
+    <div class="install">$ <code>cargo install --git https://github.com/jb55/noq</code></div>
+  </div>
+  <img class="mark tile" src="logo.svg" alt="The noq logo: a lowercase q whose bowl is split into four segments, one of them amber and lifted out.">
+</div>
+
+<section>
+  <div class="wrap">
+    <h2>Push, lease, ack</h2>
+    <p class="sub">Output from the <code>noq</code> CLI on the 617 kind-1 notes in nostrdb's test data. Every push checks the event's id and signature. A lease that isn't acked ends when its holder exits, and the events are queued again.</p>
+<pre class="term"><span class="p">$</span> noq push &lt; notes.jsonl
+<span class="ok">617 queued</span>, 0 not queued, 0 invalid
+
+<span class="p">$</span> noq lease '{"kinds":[1]}' -n 3 --ack
+{"id":"b2e03951843b…","kind":1,"content":"hello, this is my new key",…}
+{"id":"00000e1253a8…","kind":1,"content":"I am a robot beep boop! This note took 4 sec…",…}
+{"id":"a4b73fc5b901…","kind":1,"content":"I made a robot friend that mines nostr e…",…}
+
+<span class="p">$</span> noq push &lt; acked.jsonl            <span class="c"># send the consumed ones again</span>
+<span class="no">duplicate</span> b2e03951843b… 0:0
+<span class="no">duplicate</span> 00000e1253a8… 0:480
+<span class="no">duplicate</span> a4b73fc5b901… 0:1112
+
+<span class="p">$</span> noq push &lt; forged.jsonl
+<span class="no">invalid</span> 1 id does not match the event hash
+
+<span class="p">$</span> noq --segment-size 64k lease '{}' -n 100000 --ack | wc -l
+617                                  <span class="c"># 7 segment files before, 1 after</span></pre>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <h2>How it works</h2>
+    <p class="sub">Events are appended to fixed-size, memory-mapped segment files in arrival order. Each record starts with a state byte. A lease is one compare-and-swap on that byte, from LIVE to LEASED, so two consumers can never take the same event.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 236" role="img" aria-label="A row of three segment files. The oldest has every record acked and has been deleted. The middle one holds acked, leased and live records. The newest, the tail, holds live records and receives pushes. A consumer leases matching live records by compare-and-swap and acks them.">
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker>
+        </defs>
+        <!-- segment 0: drained and unlinked -->
+        <rect class="gone" x="20" y="60" width="230" height="64" rx="8"/>
+        <g id="s0"></g>
+        <text x="20" y="46" font-size="13">0000.seg</text>
+        <text x="135" y="146" font-size="12" class="dim" text-anchor="middle">all acked → file deleted</text>
+        <!-- segment 1 -->
+        <rect class="seg" x="300" y="60" width="230" height="64" rx="8"/>
+        <g id="s1"></g>
+        <text x="300" y="46" font-size="13">0001.seg</text>
+        <!-- segment 2: tail -->
+        <rect class="seg" x="580" y="60" width="230" height="64" rx="8"/>
+        <g id="s2"></g>
+        <text x="580" y="46" font-size="13">0002.seg  <tspan class="dim">tail</tspan></text>
+        <!-- push -->
+        <g style="color: var(--ink)">
+          <path class="arrow" d="M760 20 C 790 20, 800 40, 795 56" marker-end="url(#ah)"/>
+          <text x="700" y="24" font-size="13">push</text>
+        </g>
+        <!-- consumer -->
+        <g style="color: var(--accent)">
+          <path class="arrow-hot" d="M404 172 L 404 130" marker-end="url(#ah)"/>
+          <path class="arrow-hot" d="M467 172 L 467 130" marker-end="url(#ah)"/>
+        </g>
+        <rect x="300" y="176" width="250" height="40" rx="8" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="314" y="201" font-size="13">consumer: lease {"kinds":[1]}</text>
+        <text x="580" y="191" font-size="12" class="dim">lease: CAS LIVE→LEASED</text>
+        <text x="580" y="209" font-size="12" class="dim">ack → ACKED · nack or ttl → LIVE</text>
+        <text x="20" y="201" font-size="12" class="dim">arrival order →</text>
+      </svg>
+      <div class="legend">
+        <span style="--sw: var(--live); --swe: var(--live-edge)">live</span>
+        <span style="--sw: var(--leased)">leased</span>
+        <span style="--sw: var(--acked); --swe: var(--line)">acked</span>
+      </div>
+    </figure>
+    <script>
+      // Record cells per segment: l = live, x = leased, a = acked.
+      const rows = { s0: 'aaaaaaaaaa', s1: 'aaaaxaaxll', s2: 'lllllll' };
+      const xs = { s0: 20, s1: 300, s2: 580 };
+      const cls = { l: 'live', x: 'leased', a: 'acked' };
+      for (const [id, cells] of Object.entries(rows)) {
+        const g = document.getElementById(id);
+        [...cells].forEach((c, i) => {
+          const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+          r.setAttribute('x', xs[id] + 10 + i * 21);
+          r.setAttribute('y', 72 + (c === 'x' ? 12 : 0));
+          r.setAttribute('width', 17);
+          r.setAttribute('height', 40);
+          r.setAttribute('rx', 3);
+          r.setAttribute('class', cls[c]);
+          if (id === 's0') r.setAttribute('opacity', '0.45');
+          g.appendChild(r);
+        });
+      }
+    </script>
+
+    <div class="grid" style="margin-top: 22px">
+      <div class="card"><h3>Verified on the way in</h3><p>One pass over the JSON checks it strictly, computes the event id and verifies the schnorr signature. Malformed or forged events are rejected before anything is written.</p></div>
+      <div class="card"><h3>The JSON is the wire format</h3><p>Each record keeps the original JSON next to a small span index into it. A leased event goes back out byte for byte, with no re-serialization.</p></div>
+      <div class="card"><h3>NIP-01 filters, planned</h3><p>Ids, authors, kinds, tags, since and until, matched against the packed record in place. In-memory indexes let a lease skip straight to matching events.</p></div>
+      <div class="card"><h3>Leases with a ttl</h3><p>Ack consumes an event. Nack or an expired ttl queues it again. <code>wait_lease</code> blocks until a push, nack or expiry gives it something to take.</p></div>
+      <div class="card"><h3>The disk drains</h3><p>Fully consumed segments are deleted. Mostly consumed ones are compacted, moving their remaining events forward so the file can go too.</p></div>
+      <div class="card"><h3>Crash safe</h3><p>Each record carries a CRC32C. Reopening a log after a crash drops a torn record at the tail. Sealed segments keep a sidecar index, so reopening is fast.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>As a library</h2>
+    <p class="sub">The CLI is a thin layer over the crate. A process opens the queue once and shares it between threads, so one pushes while others lease.</p>
+<pre class="code"><span class="k">use</span> noq::{<span class="t">Config</span>, <span class="t">Filter</span>, <span class="t">Noq</span>};
+<span class="k">use</span> std::time::<span class="t">Duration</span>;
+
+<span class="k">let</span> q = <span class="t">Noq</span>::open(<span class="s">"queue"</span>, <span class="t">Config</span>::default())?;
+q.push(json)?;                          <span class="c">// id and sig checked; Queued, Duplicate, Seen or Expired</span>
+
+<span class="k">let</span> dms = <span class="t">Filter</span>::new().kinds([<span class="s">4</span>, <span class="s">1059</span>]);
+<span class="k">for</span> lease <span class="k">in</span> q.wait_lease(&amp;dms, <span class="s">100</span>, <span class="t">Duration</span>::from_secs(<span class="s">30</span>), <span class="t">Duration</span>::from_secs(<span class="s">5</span>)) {
+    deliver(lease.json())?;             <span class="c">// the original event json, as it was pushed</span>
+    lease.ack()?;                       <span class="c">// or lease.nack() to queue it again</span>
+}</pre>
+  </div>
+</section>
+
+<section id="numbers">
+  <div class="wrap">
+    <h2>Numbers</h2>
+    <p class="sub">On nostrdb's 1,004,866-event test file (2.0 GiB of JSON), on a 32-core machine with zfs. Every push verifies the id and signature.</p>
+    <div class="stats">
+      <div class="stat"><b>48,926/s</b><span>verified push, 32 threads</span></div>
+      <div class="stat"><b>218,988/s</b><span>lease + ack, batches of 100</span></div>
+      <div class="stat"><b>8.4 MiB</b><span>left on disk after draining a 1.2 GiB queue</span></div>
+    </div>
+    <p class="note">One run each, warm cache, <code>--fsync never</code>. The comparison with nostrdb and strfry, and what each number does and doesn't measure, is in <a href="https://github.com/jb55/noq/blob/master/bench/README.md">bench/README.md</a>. Reproduce with <code>noq bench events.jsonl</code>.</p>
+  </div>
+</section>
+
+<section class="status">
+  <div class="wrap">
+    <h2>Status</h2>
+    <p class="sub">Early, version 0.1. The storage, leasing and filtering work and are tested. The API will still change.</p>
+    <ul>
+      <li>One process owns a queue directory. Its writer and consumers are threads.</li>
+      <li>One queue per directory, with no consumer groups.</li>
+      <li>No network front yet: an app embeds the crate or drives the CLI.</li>
+      <li>Every event is queued on its own, replaceable and addressable kinds included. Deciding which version is newest is the consumer's job.</li>
+    </ul>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span><img class="tile" src="logo.svg" alt="">noq</span>
+    <a href="https://github.com/jb55/noq">github.com/jb55/noq</a>
+    <span>Pure Rust · built on nostrdb's note format ideas</span>
+  </div>
+</footer>
+
+</body>
+</html>
