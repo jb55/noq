@@ -7,6 +7,9 @@
 //! under its lock, and only for the lease whose token the entry holds. A
 //! lease that expired and was handed to someone else can therefore no
 //! longer ack or nack it.
+//!
+//! A lease that runs out puts its item back in the queue, so reaping bumps
+//! the queue's [`Signal`] for anyone waiting to lease.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -16,12 +19,15 @@ use std::time::Instant;
 use parking_lot::{Condvar, Mutex};
 
 use crate::log::Record;
+use crate::notify::Signal;
 use crate::segment::{Seq, State};
 
 pub(crate) struct Leases {
     table: Mutex<Table>,
     /// Signalled when the earliest deadline may have moved up, or on stop.
     wake: Condvar,
+    /// Bumped when reaping requeues something.
+    requeued: Arc<Signal>,
 }
 
 struct Table {
@@ -39,7 +45,7 @@ struct Held {
 }
 
 impl Leases {
-    pub(crate) fn new() -> Arc<Leases> {
+    pub(crate) fn new(requeued: Arc<Signal>) -> Arc<Leases> {
         Arc::new(Leases {
             table: Mutex::new(Table {
                 held: HashMap::new(),
@@ -48,6 +54,7 @@ impl Leases {
                 stop: false,
             }),
             wake: Condvar::new(),
+            requeued,
         })
     }
 
@@ -62,7 +69,9 @@ impl Leases {
     fn run_reaper(&self) {
         let mut t = self.table.lock();
         while !t.stop {
-            t.reap(Instant::now());
+            if t.reap(Instant::now()) > 0 {
+                self.requeued.bump();
+            }
             match t.deadlines.first() {
                 Some(&(at, _)) => {
                     self.wake.wait_until(&mut t, at);
@@ -136,7 +145,11 @@ impl Leases {
     /// Requeues every lease whose deadline is at or before `now`. Returns
     /// how many.
     pub(crate) fn reap(&self, now: Instant) -> usize {
-        self.table.lock().reap(now)
+        let n = self.table.lock().reap(now);
+        if n > 0 {
+            self.requeued.bump();
+        }
+        n
     }
 
     /// How many leases are held.

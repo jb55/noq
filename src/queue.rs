@@ -24,6 +24,12 @@
 //!
 //! Every id stays known while its record is in the log, and a bounded seen
 //! ring remembers it after, so pushing a consumed event again is a no-op.
+//!
+//! [`wait_lease`](Noq::wait_lease) blocks until a lease gets something. It
+//! sleeps on a [`Signal`] that a push which queues an item, a nack and a
+//! lease running out each bump, and tries again on every bump. While it
+//! sleeps it also wakes at the next expiry, so a queue nobody pushes to
+//! still sweeps.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -42,6 +48,7 @@ use crate::index::{Index, Plan};
 use crate::lease::Leases;
 use crate::log::{Config, Log, Record};
 use crate::note::{KindClass, NoteRef};
+use crate::notify::Signal;
 use crate::segment::{Seq, State};
 
 /// Candidates read from the index per lock: a walk holds the index's read
@@ -113,6 +120,8 @@ struct Inner {
     /// [`Log::dropped`] when the index was last trimmed.
     trimmed: AtomicU64,
     expiry: Expiry,
+    /// Bumped when an item may have become leasable.
+    queued: Arc<Signal>,
     leases: Arc<Leases>,
     reaper: Option<JoinHandle<()>>,
 }
@@ -152,7 +161,8 @@ impl Noq {
                 expiry.add(at, rec.seq());
             }
         }
-        let leases = Leases::new();
+        let queued = Arc::new(Signal::default());
+        let leases = Leases::new(queued.clone());
         let reaper = Some(leases.spawn_reaper()?);
         let q = Noq(Arc::new(Inner {
             log,
@@ -160,6 +170,7 @@ impl Noq {
             push_lock: Mutex::new(()),
             trimmed,
             expiry,
+            queued,
             leases,
             reaper,
         }));
@@ -219,6 +230,9 @@ impl Noq {
                 _ => Pushed::Queued(seq),
             }
         };
+        if pushed.queued().is_some() {
+            inner.queued.bump();
+        }
         if inner.expiry.is_due(now) {
             inner.expiry.sweep(&inner.log, now);
         }
@@ -251,6 +265,47 @@ impl Noq {
             });
         }
         self.hold(taken, ttl)
+    }
+
+    /// Like [`lease`](Self::lease), but if nothing matches, waits for
+    /// something to, for up to `timeout`. Returns as soon as one lease gets
+    /// anything, so it may return fewer than `limit` items even if more
+    /// arrive just after; empty means the timeout passed.
+    ///
+    /// Every push that queues an item, nack and lease running out wakes
+    /// each waiter to lease again, matching or not.
+    pub fn wait_lease(
+        &self,
+        filter: &Filter,
+        limit: usize,
+        ttl: Duration,
+        timeout: Duration,
+    ) -> Vec<Lease> {
+        let until = Instant::now().checked_add(timeout);
+        loop {
+            // Read before leasing: anything queued after the lease's walk
+            // started has moved it.
+            let seen = self.0.queued.generation();
+            let got = self.lease(filter, limit, ttl);
+            if !got.is_empty() || filter.get_limit().map_or(limit, |l| l.min(limit)) == 0 {
+                return got;
+            }
+            let now = Instant::now();
+            if until.is_some_and(|at| at <= now) {
+                return got;
+            }
+            // Wake for the next expiry too: the lease above sweeps it, so a
+            // queue that is only waited on still lets expired segments go.
+            let sweep = self.0.expiry.next().map(|at| {
+                let secs = at.saturating_sub(expire::now()).max(1);
+                now.checked_add(Duration::from_secs(secs))
+            });
+            let wake = match (until, sweep.flatten()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            self.0.queued.wait(seen, wake);
+        }
     }
 
     /// Up to `limit` queued items matching `filter`, oldest first, without
@@ -515,7 +570,9 @@ impl Lease {
             noq.log.retire(&self.record, State::Leased, to)
         };
         debug_assert!(moved, "a released lease's record is still LEASED");
-        if to != State::Live {
+        if to == State::Live {
+            noq.queued.bump();
+        } else {
             self.noq.trim();
         }
         Ok(())

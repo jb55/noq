@@ -14,6 +14,7 @@ mod json;
 mod lease;
 mod log;
 mod note;
+mod notify;
 mod queue;
 mod segment;
 mod verify;

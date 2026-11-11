@@ -71,6 +71,12 @@ impl Expiry {
         self.next.load(Ordering::Relaxed) <= now
     }
 
+    /// The unix second the next sweep has work, if any record is
+    /// scheduled.
+    pub(crate) fn next(&self) -> Option<u64> {
+        Some(self.next.load(Ordering::Relaxed)).filter(|&at| at != u64::MAX)
+    }
+
     /// Kills every LIVE record whose time is at or before `now`. Returns
     /// how many. A LEASED one is left to its holder and looked at again a
     /// second later: an ack consumes it, and a nack puts it where the next
