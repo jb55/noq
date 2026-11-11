@@ -229,24 +229,52 @@ impl Segment {
         was == 1
     }
 
-    /// The record at `off`, if a committed record starts there. `off` must
-    /// be the start of a record (0, or a previous record's
+    /// The record at `off`, if a committed record starts there. `off`
+    /// should be the start of a record (0, or a previous record's
     /// [`next`](RecordRef::next)).
+    ///
+    /// Any other `off` is safe too: the header is checked to lie wholly
+    /// below the end before any slice is built, so a stale or made-up seq
+    /// gets `None`, or at worst in-bounds bytes from the middle of another
+    /// record, never a read past the end. The checks are integer compares,
+    /// no crc, to keep scans fast.
     pub fn record(&self, off: u32) -> Option<RecordRef<'_>> {
-        if off >= self.end() {
+        let end = self.end() as usize;
+        let off_us = off as usize;
+        if !off_us.is_multiple_of(8) || off_us + RECORD_HEADER_LEN > end {
             return None;
         }
-        // SAFETY: off is a record boundary below the committed end, so the
-        // header and body were written before `end` was released past them
-        // and only the state byte changes from here on.
+        // SAFETY: [off, off + RECORD_HEADER_LEN) is below the committed end,
+        // so it was written before `end` was released past it, and below
+        // the end only the state byte changes from here on.
+        let (base, total_len, note_len, ver, state) = unsafe {
+            let base = self.map.as_ptr().add(off_us);
+            (
+                base,
+                read_u32(base) as usize,
+                read_u32(base.add(OFF_NOTE_LEN)) as usize,
+                *base.add(OFF_VER),
+                AtomicU8::from_ptr(base.add(OFF_STATE) as *mut u8),
+            )
+        };
+        if ver != RECORD_VERSION
+            || total_len < RECORD_HEADER_LEN
+            || note_len > total_len - RECORD_HEADER_LEN
+            || off_us + stride(total_len) > end
+        {
+            return None;
+        }
+        match State::from_u8(state.load(Ordering::Acquire)) {
+            None | Some(State::Writing) => return None,
+            Some(_) => {}
+        }
+        // SAFETY: the whole record, [off, off + total_len), is below the
+        // committed end, by the checks above.
         unsafe {
-            let base = self.map.as_ptr().add(off as usize);
-            let total_len = read_u32(base) as usize;
-            let note_len = read_u32(base.add(OFF_NOTE_LEN)) as usize;
             let body = base.add(RECORD_HEADER_LEN);
             Some(RecordRef {
                 seq: Seq::new(self.id, off),
-                state: AtomicU8::from_ptr(base.add(OFF_STATE) as *mut u8),
+                state,
                 index: std::slice::from_raw_parts(body, note_len),
                 json: std::slice::from_raw_parts(
                     body.add(note_len),

@@ -170,6 +170,127 @@ fn recovery_truncates_at_overlong_record() {
     truncates_at(|p, off, _| poke(p, off, &u32::MAX.to_le_bytes()));
 }
 
+/// Reads everything a record hands out, so an out-of-bounds slice would
+/// fault here rather than go unnoticed.
+fn touch(r: &Record) -> usize {
+    let _ = r.state();
+    r.json().iter().map(|&b| b as usize).sum::<usize>() + r.get().index().len()
+}
+
+#[test]
+fn seqs_off_a_record_start_read_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let evs = events();
+    let log = Log::open(dir.path(), small(Fsync::Never)).unwrap();
+    let seqs: Vec<Seq> = evs[..20].iter().map(|e| log.append(e).unwrap()).collect();
+    let end = log.tail_seq().offset();
+
+    assert!(log.get(Seq::new(0, 8)).is_none());
+    assert_eq!(log.scan(Seq::new(0, 8)).count(), 0);
+
+    // Every offset that isn't a record start, aligned or not, up to past
+    // the end, is refused, and a scan from it finds nothing.
+    for off in 0..end + 64 {
+        let seq = Seq::new(0, off);
+        if seqs.contains(&seq) {
+            assert!(log.get(seq).is_some());
+            continue;
+        }
+        assert!(log.get(seq).is_none(), "{off} is not a record start");
+        assert!(log.scan(seq).next().is_none());
+    }
+    assert!(log.get(Seq::new(0, u32::MAX)).is_none());
+    assert!(log.get(Seq::new(u32::MAX, 0)).is_none());
+}
+
+#[test]
+fn forged_headers_inside_a_record_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let evs = events();
+    let log = Log::open(dir.path(), small(Fsync::Never)).unwrap();
+    let ev = evs.iter().max_by_key(|e| e.len()).unwrap();
+    let first = log.append(ev).unwrap();
+    log.append(&evs[0]).unwrap();
+    let end = log.tail_seq().offset() as u64;
+
+    // Write a header into the first record's json through the file, which
+    // the log's shared map sees: an aligned offset whose bytes now claim a
+    // record as long or longer than the rest of the segment.
+    let path = seg_path(dir.path(), 0);
+    let at = (first.offset() as u64 + RECORD_HEADER_LEN as u64 + 64) & !7;
+    let seq = Seq::new(0, at as u32);
+    let header = |total_len: u32, note_len: u32| {
+        let mut h = [0u8; RECORD_HEADER_LEN];
+        h[0..4].copy_from_slice(&total_len.to_le_bytes());
+        h[4] = State::Live as u8;
+        h[5] = 1;
+        h[8..12].copy_from_slice(&note_len.to_le_bytes());
+        h
+    };
+    let past_end = (end - at + 8) as u32;
+    for (total_len, note_len) in [
+        (1 << 30, 0),  // far past the map
+        (past_end, 0), // just past the committed end
+        (u32::MAX, 0), // stride overflows a u32
+        (64, 1 << 20), // index longer than the record
+        (8, 0),        // shorter than a header
+    ] {
+        poke(&path, at, &header(total_len, note_len));
+        assert!(log.get(seq).is_none(), "total {total_len} note {note_len}");
+        assert!(log.scan(seq).next().is_none());
+    }
+
+    // A header that fits but carries a bad state or version is refused too.
+    let mut h = header(64, 0);
+    h[4] = 9;
+    poke(&path, at, &h);
+    assert!(log.get(seq).is_none(), "unknown state");
+    h[4] = State::Writing as u8;
+    poke(&path, at, &h);
+    assert!(log.get(seq).is_none(), "WRITING below the end");
+    let mut h = header(64, 0);
+    h[5] = 2;
+    poke(&path, at, &h);
+    assert!(log.get(seq).is_none(), "unknown version");
+
+    // One that passes every check is in-bounds bytes, nothing worse.
+    poke(&path, at, &header(64, 0));
+    let r = log.get(seq).unwrap();
+    assert_eq!(r.json().len(), 64 - RECORD_HEADER_LEN);
+    touch(&r);
+}
+
+#[test]
+fn seq_from_before_a_crash_cannot_reach_past_the_end() {
+    // B is torn, recovery ends the segment at B, and a new record is
+    // written over it. C's old seq now points into the new record.
+    let dir = tempfile::tempdir().unwrap();
+    let evs = events();
+    let seqs: Vec<Seq> = {
+        let log = Log::open(dir.path(), small(Fsync::Always)).unwrap();
+        evs[..3].iter().map(|e| log.append(e).unwrap()).collect()
+    };
+    poke(
+        &seg_path(dir.path(), 0),
+        seqs[1].offset() as u64 + 4,
+        &[State::Writing as u8],
+    );
+
+    let log = Log::open(dir.path(), small(Fsync::Always)).unwrap();
+    assert!(log.get(seqs[2]).is_none(), "C is past the recovered end");
+    let long = evs.iter().max_by_key(|e| e.len()).unwrap();
+    assert!(long.len() > evs[1].len() + evs[2].len());
+    assert_eq!(log.append(long).unwrap(), seqs[1]);
+    if let Some(r) = log.get(seqs[2]) {
+        touch(&r);
+    }
+    let mut scan = log.scan(seqs[2]);
+    if let Some(r) = scan.next() {
+        touch(&r);
+    }
+    assert!(scan.next().is_none());
+}
+
 #[test]
 fn reopen_returns_leased_to_live() {
     let dir = tempfile::tempdir().unwrap();
