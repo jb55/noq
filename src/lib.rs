@@ -7,6 +7,8 @@
 
 mod builder;
 mod error;
+mod filter;
+mod index;
 mod json;
 mod lease;
 mod log;
@@ -17,8 +19,10 @@ mod verify;
 
 pub use builder::{NoteBuilder, build_note};
 pub use error::Error;
+pub use filter::{Filter, TagClause};
+pub use index::Plan;
 pub use log::{Config, Fsync, Log, Record, Scan};
 pub use note::{HEAD_LEN, NoteRef, Span, Tag, TagValues, Tags};
-pub use queue::{Lease, Noq};
+pub use queue::{IndexStats, Lease, Noq, Pushed};
 pub use segment::{RECORD_HEADER_LEN, RECORD_VERSION, RecordRef, Records, Segment, Seq, State};
 pub use verify::{canonical, compute_id, verify_sig};

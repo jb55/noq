@@ -62,7 +62,7 @@ pub(crate) fn parse_event(json: &[u8], tags: &mut TagSections) -> Result<Fields,
     }
     tags.clear();
 
-    let mut p = Parser { b: json, i: 0 };
+    let mut p = Parser::new(json);
     let mut f = Fields {
         id: [0; 32],
         pubkey: [0; 32],
@@ -158,37 +158,41 @@ fn field_name(bit: u8) -> &'static str {
     }
 }
 
-struct Parser<'a> {
-    b: &'a [u8],
-    i: usize,
+pub(crate) struct Parser<'a> {
+    pub b: &'a [u8],
+    pub i: usize,
 }
 
-impl Parser<'_> {
-    fn peek(&self) -> Option<u8> {
+impl<'a> Parser<'a> {
+    pub fn new(b: &'a [u8]) -> Parser<'a> {
+        Parser { b, i: 0 }
+    }
+
+    pub fn peek(&self) -> Option<u8> {
         self.b.get(self.i).copied()
     }
 
-    fn next(&mut self) -> Option<u8> {
+    pub fn next(&mut self) -> Option<u8> {
         let c = self.peek()?;
         self.i += 1;
         Some(c)
     }
 
-    fn err(&self, what: &'static str) -> Error {
+    pub fn err(&self, what: &'static str) -> Error {
         self.err_at(self.i, what)
     }
 
-    fn err_at(&self, at: usize, what: &'static str) -> Error {
+    pub fn err_at(&self, at: usize, what: &'static str) -> Error {
         Error::Json { at, what }
     }
 
-    fn ws(&mut self) {
+    pub fn ws(&mut self) {
         while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.peek() {
             self.i += 1;
         }
     }
 
-    fn expect(&mut self, c: u8) -> Result<(), Error> {
+    pub fn expect(&mut self, c: u8) -> Result<(), Error> {
         if self.peek() == Some(c) {
             self.i += 1;
             Ok(())
@@ -206,7 +210,7 @@ impl Parser<'_> {
     /// Consumes a string and returns the byte range between its quotes and
     /// whether it holds escapes. Escapes are checked for shape here; their
     /// meaning is decoded by [`unescape`].
-    fn string(&mut self) -> Result<(usize, usize, bool), Error> {
+    pub fn string(&mut self) -> Result<(usize, usize, bool), Error> {
         self.expect(b'"')?;
         let start = self.i;
         let mut escaped = false;
@@ -237,7 +241,7 @@ impl Parser<'_> {
     }
 
     /// A lowercase-hex string of exactly `N` bytes.
-    fn hex<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+    pub fn hex<const N: usize>(&mut self) -> Result<[u8; N], Error> {
         let at = self.i;
         let (s, e, _) = self.string()?;
         let raw = &self.b[s..e];
@@ -256,7 +260,7 @@ impl Parser<'_> {
 
     /// A non-negative integer with no sign, fraction, exponent or leading
     /// zero, so its canonical form is its decimal digits.
-    fn uint(&mut self) -> Result<u64, Error> {
+    pub fn uint(&mut self) -> Result<u64, Error> {
         let start = self.i;
         let mut n: u64 = 0;
         while let Some(c @ b'0'..=b'9') = self.peek() {

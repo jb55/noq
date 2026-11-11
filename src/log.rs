@@ -15,6 +15,7 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
@@ -58,6 +59,8 @@ pub struct Log {
     config: Config,
     /// Every segment, oldest first. The last is the tail.
     segments: RwLock<Vec<Arc<Segment>>>,
+    /// Segments dropped since open.
+    dropped: AtomicU64,
     writer: Mutex<Writer>,
     /// Held for the log's lifetime so a second process can't open it.
     _lock: File,
@@ -119,6 +122,7 @@ impl Log {
             dir,
             config,
             segments: RwLock::new(segments),
+            dropped: AtomicU64::new(0),
             _lock: lock,
         })
     }
@@ -232,6 +236,7 @@ impl Log {
                 return;
             };
             segs.remove(i);
+            self.dropped.fetch_add(1, Ordering::Release);
         }
         let _ = fs::remove_file(seg.path());
     }
@@ -253,6 +258,12 @@ impl Log {
     /// A snapshot of the segments, oldest first.
     pub fn segments(&self) -> Vec<Arc<Segment>> {
         self.segments.read().clone()
+    }
+
+    /// How many segments have been dropped since the log was opened. Any
+    /// change means some seqs are gone, not necessarily the oldest.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Acquire)
     }
 
     /// The seq of the oldest segment's start. Every seq before it is gone.

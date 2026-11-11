@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use noq::{Config, Error, Fsync, Lease, Log, Noq, Segment, Seq, State};
+use noq::{Config, Error, Fsync, Lease, Log, Noq, Pushed, Segment, Seq, State};
 
 fn events() -> Vec<Vec<u8>> {
     std::fs::read("tests/data/many-events-sample.jsonl")
@@ -16,6 +16,14 @@ fn events() -> Vec<Vec<u8>> {
         .map(<[u8]>::to_vec)
         .filter(|l| noq::build_note(l).is_ok())
         .collect()
+}
+
+/// Pushes an event that must be new.
+fn push(q: &Noq, ev: &[u8]) -> Seq {
+    match q.push(ev).unwrap() {
+        Pushed::Queued(seq) => seq,
+        d => panic!("not queued: {d:?}"),
+    }
 }
 
 fn small() -> Config {
@@ -49,7 +57,7 @@ fn lease_ack_nack() {
     let dir = tempfile::tempdir().unwrap();
     let q = Noq::open(dir.path(), small()).unwrap();
     let evs = events();
-    let seqs: Vec<Seq> = evs[..10].iter().map(|e| q.push(e).unwrap()).collect();
+    let seqs: Vec<Seq> = evs[..10].iter().map(|e| push(&q, e)).collect();
 
     let ls = any(4, &q, LONG);
     assert_eq!(ls.iter().map(Lease::seq).collect::<Vec<_>>(), seqs[..4]);
@@ -86,7 +94,7 @@ fn lease_ack_nack() {
 fn lease_seq_takes_one_item() {
     let dir = tempfile::tempdir().unwrap();
     let q = Noq::open(dir.path(), small()).unwrap();
-    let seq = q.push(&events()[0]).unwrap();
+    let seq = push(&q, &events()[0]);
     let l = q.lease_seq(seq, LONG).unwrap();
     assert!(q.lease_seq(seq, LONG).is_none());
     l.ack().unwrap();
@@ -98,7 +106,7 @@ fn lease_seq_takes_one_item() {
 fn expired_lease_is_requeued_and_its_holder_locked_out() {
     let dir = tempfile::tempdir().unwrap();
     let q = Noq::open(dir.path(), small()).unwrap();
-    let seq = q.push(&events()[0]).unwrap();
+    let seq = push(&q, &events()[0]);
 
     let mut old = any(1, &q, Duration::ZERO).pop().unwrap();
     assert_eq!(q.reap(), 1);
@@ -119,11 +127,11 @@ fn expired_lease_is_requeued_and_its_holder_locked_out() {
 fn reaper_thread_requeues_on_its_own() {
     let dir = tempfile::tempdir().unwrap();
     let q = Noq::open(dir.path(), small()).unwrap();
-    let seq = q.push(&events()[0]).unwrap();
+    let seq = push(&q, &events()[0]);
     // A long lease first, so the reaper is asleep on a far deadline when
     // the short one arrives and has to be woken for it.
     let evs = events();
-    q.push(&evs[1]).unwrap();
+    push(&q, &evs[1]);
     let _long = q.lease_where(1, LONG, |n| n.json() == &evs[1][..]);
     let short = q.lease_seq(seq, Duration::from_millis(30)).unwrap();
 
@@ -140,7 +148,7 @@ fn reaper_thread_requeues_on_its_own() {
 fn extend_moves_the_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let q = Noq::open(dir.path(), small()).unwrap();
-    let seq = q.push(&events()[0]).unwrap();
+    let seq = push(&q, &events()[0]);
     let mut l = any(1, &q, Duration::ZERO).pop().unwrap();
     l.extend(LONG).unwrap();
     assert!(l.deadline() > Instant::now() + LONG / 2);
@@ -155,8 +163,9 @@ fn concurrent_consumers_never_share_an_item() {
     let q = Noq::open(dir.path(), small()).unwrap();
     let evs = events();
     let n = evs.len() * 2;
+    // Twice over, behind the index's back: push would drop the repeats.
     for ev in evs.iter().chain(&evs) {
-        q.push(ev).unwrap();
+        q.log().append(ev).unwrap();
     }
 
     let held = Arc::new(Mutex::new(HashSet::new()));
@@ -203,9 +212,10 @@ fn drained_segments_are_unlinked() {
     let dir = tempfile::tempdir().unwrap();
     let q = Noq::open(dir.path(), small()).unwrap();
     let evs = events();
+    // Repeats go straight to the log; push would drop them as duplicates.
     for _ in 0..4 {
         for ev in &evs {
-            q.push(ev).unwrap();
+            q.log().append(ev).unwrap();
         }
     }
     let files = seg_files(dir.path());
@@ -236,7 +246,7 @@ fn drained_segments_are_unlinked() {
     // A tail that is drained when a rotation seals it goes right then.
     let mut i = 0;
     let last = loop {
-        let seq = q.push(&evs[i % evs.len()]).unwrap();
+        let seq = q.log().append(&evs[i % evs.len()]).unwrap();
         i += 1;
         if seq.segment() != tail {
             break seq;
@@ -289,7 +299,7 @@ fn pending_counts_survive_reopen_and_drained_files_go_at_open() {
 fn dropping_the_queue_stops_the_reaper() {
     let dir = tempfile::tempdir().unwrap();
     let q = Noq::open(dir.path(), small()).unwrap();
-    q.push(&events()[0]).unwrap();
+    push(&q, &events()[0]);
     let l = any(1, &q, LONG).pop().unwrap();
     drop(q);
     // The lease keeps the queue alive; dropping both joins the reaper.
